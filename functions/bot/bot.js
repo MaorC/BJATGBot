@@ -1,5 +1,4 @@
 const { Telegraf } = require('telegraf');
-const { session } = require('telegraf');
 const { message } = require('telegraf/filters');
 const { createClient } = require('@supabase/supabase-js');
 const dotenv = require('dotenv');
@@ -7,7 +6,6 @@ const dotenv = require('dotenv');
 dotenv.config();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
-bot.use(session());
 
 const TOPIC_ID = parseInt(process.env.TOPIC_ID);
 const ADMINS = process.env.ADMINS.split(',').map(id => parseInt(id.trim()));
@@ -17,16 +15,112 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const SUPA_TABLE = process.env.SUPABASE_TABLE;
 const SUPA_KEY = process.env.SUPABASE_KEY_NAME;
 
-function getMainMenu() {
-    return {
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '✉️ Send Anonymous Message', callback_data: 'anon' }],
-                [{ text: '🗣️ Send Feedback', callback_data: 'feedback' }],
-                [{ text: '⚙️ Admin Panel', callback_data: 'admin' }]
-            ]
-        }
-    };
+// --- State Management Helpers ---
+
+async function getUserMode(userId) {
+  const { data } = await supabase
+    .from('users')
+    .select('chat_mode')
+    .eq('user_id', userId)
+    .maybeSingle();
+  return data?.chat_mode || null;
+}
+
+async function setUserMode(userId, mode) {
+  // We assume user row exists (ensureUserRow handles creation)
+  // But upsert is safer if order of ops varies
+  await supabase
+    .from('users')
+    .update({ chat_mode: mode })
+    .eq('user_id', userId);
+}
+
+// function getMainMenu() {
+//     return {
+//         reply_markup: {
+//             inline_keyboard: [
+//                 [{ text: '✉️ Send Anonymous Message', callback_data: 'anon' }],
+//                 [{ text: '🗣️ Send Feedback', callback_data: 'feedback' }],
+//                 [{ text: '⚙️ Admin Panel', callback_data: 'admin' }]
+//             ]
+//         }
+//     };
+// }
+
+function getFirstTimeMenu() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: 'ℹ️ About us', callback_data: 'ft_about' }],
+        [{ text: '📜 Community Rules', callback_data: 'ft_rules' }],
+        [{ text: '🛫 Request to Join', callback_data: 'ft_join' }],
+      ],
+    },
+  };
+}
+
+function getExistingUserMenu() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '❓ Ask anonymously', callback_data: 'ex_anon' }],
+        [{ text: '🗣️ Send Feedback', callback_data: 'feedback' }],
+        [{ text: '💎 Bluejay Premium', callback_data: 'ex_premium' }],
+        [{ text: '🧾 Update pilot info', callback_data: 'ex_crm' }],
+        [{ text: '☎️ Contact us', callback_data: 'ex_contact' }],
+        [{ text: '⚙️ Admin Panel', callback_data: 'admin' }],
+      ],
+    },
+  };
+}
+
+function getJoinGroupsMenu() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🛋️ Lounge', callback_data: 'join_lounge' }],
+        [{ text: '✈️ Commercial Aviation', callback_data: 'join_commercial' }],
+        [{ text: '🧑‍🏫 Flight Instructors', callback_data: 'join_instructors' }],
+        [{ text: '👨‍✈️ Cadet Pilots', callback_data: 'join_cadets' }],
+        [{ text: '🔙 Back', callback_data: 'back_home' }],
+      ],
+    },
+  };
+}
+
+// small helper: decide if first-time user
+async function ensureUserRow(ctx) {
+  const { id: user_id, username, first_name } = ctx.from;
+
+  const { data } = await supabase
+    .from('users')
+    .select('user_id')
+    .eq('user_id', user_id)
+    .maybeSingle();
+
+  if (data) return { isFirstTime: false };
+
+  await supabase.from('users').insert([{ user_id, username, first_name }]);
+  return { isFirstTime: true };
+}
+
+async function showHomeMenu(ctx) {
+  // Clear any existing mode in DB
+  await setUserMode(ctx.from.id, null);
+
+  const { isFirstTime } = await ensureUserRow(ctx);
+
+  if (isFirstTime) {
+    return ctx.reply(
+      '👋 Welcome! Choose an option:',
+      { ...getFirstTimeMenu(), parse_mode: 'Markdown' }
+    );
+  }
+
+  return ctx.reply(
+    '👋 Welcome back! What would you like to do?',
+    { ...getExistingUserMenu(), parse_mode: 'Markdown' }
+  );
 }
 
 function getAdminPanel() {
@@ -72,11 +166,12 @@ async function setBotEnabled(state) {
 }
 
 bot.on('callback_query', async (ctx) => {
+    try { await ctx.answerCbQuery(); } catch (e) {}
     const action = ctx.callbackQuery.data;
+    const userId = ctx.from.id;
 
     if (action === 'anon' || action === 'feedback') {
-        ctx.session = ctx.session || {};
-        ctx.session.mode = action;
+        await setUserMode(userId, action);
         const prompt = action === 'anon' ? '📝 Please type your anonymous message:\n\n⚠️ Warning: This bot is actively monitored. Misuse — including spam, offensive language, or abuse — will result in permanent removal and blocking of the user. Please use responsibly.' : '💬 Please leave your feedback:';
         return ctx.reply(prompt);
     }
@@ -86,9 +181,155 @@ bot.on('callback_query', async (ctx) => {
         return ctx.reply('🔧 Admin Panel:', getAdminPanel());
     }
     if (action === 'back_to_main') {
-        ctx.session = {};
-        return ctx.reply('Please choose an option from the menu to proceed:', getMainMenu());
+        await setUserMode(userId, null);
+        return ctx.reply('Please choose an option from the menu to proceed:', getExistingUserMenu());
     }
+
+
+    // universal back button
+    if (action === 'back_home') {
+        return showHomeMenu(ctx);
+    }
+
+    // ===== First-time menu =====
+    if (action === 'ft_about') {
+    return ctx.reply(
+        `ℹ️ *About us*\n\nBlue Jay Aviation is a community for Israeli pilots — professional, helpful, and drama-free.\n\n(put your final “about us” text here)`,
+        { parse_mode: 'Markdown' }
+    );
+    }
+
+    if (action === 'ft_rules') {
+        return ctx.reply(
+            `📜 *Community Rules*\n\n1) Be respectful\n2) No spam\n3) Keep it professional\n4) No doxxing\n\n(put your final rules here)`,
+            { parse_mode: 'Markdown' }
+        );
+    }
+
+    if (action === 'ft_join') {
+        await setUserMode(userId, 'join_select');
+        return ctx.reply('🛫 Choose the group you want to request joining:', getJoinGroupsMenu());
+    }
+
+    // ===== Existing user menu =====
+    if (action === 'ex_anon') {
+        await setUserMode(userId, 'anon_pending_approval');
+        return ctx.reply(
+            '📝 Type your anonymous question.\n\nIt will be reviewed by an admin before being published.'
+        );
+    }
+
+    if (action === 'ex_contact') {
+        await setUserMode(userId, 'contact_waiting');
+        return ctx.reply('☎️ Please type your message and we’ll get back to you:');
+    }
+
+    if (action === 'ex_premium') {
+        return ctx.reply('💎 Bluejay Premium:\n\n(put your premium onboarding info here)');
+    }
+
+    if (action === 'ex_crm') {
+        // you can turn this into a multi-step flow later
+        await setUserMode(userId, 'crm_waiting');
+        return ctx.reply(
+            '🧾 Update pilot info:\n\nSend your details in this format:\nName:\nLicense:\nAircraft/Type:\nBase:\nNotes:'
+        );
+    }
+
+    // ===== Join group selection =====
+    if (action.startsWith('join_')) {
+        const groupKey = action.replace('join_', '');
+
+        const { id: user_id, username, first_name } = ctx.from;
+
+        // store request (optional but recommended)
+        await supabase.from('join_requests').insert([{
+            user_id,
+            username,
+            group_key: groupKey
+        }]);
+
+        // Send form to Feedback group
+        const now = new Date();
+        const dateStr = now.toLocaleString('en-GB', { timeZone: 'Asia/Jerusalem' });
+
+        const groupNames = {
+            lounge: 'Lounge',
+            commercial: 'Commercial Aviation',
+            instructors: 'Flight Instructors',
+            cadets: 'Cadet Pilots',
+        };
+
+        const formText =
+        `🛫 *User request to join form*
+
+        👤 Name: ${first_name || 'N/A'}
+        🔖 Username: @${username || 'N/A'}
+        🆔 User ID: ${user_id}
+        🕒 Date: ${dateStr}
+
+        📌 Requested group: *${groupNames[groupKey] || groupKey}*
+
+        ✅ Action: Admin should contact + manually approve & add user.`;
+
+        await ctx.telegram.sendMessage(FEEDBACK_CHANNEL_ID, formText, { parse_mode: 'Markdown' });
+
+        await setUserMode(user_id, null);
+        return ctx.reply('✅ Your request was sent to the admins. They’ll contact you soon.');
+    }
+
+    // ===== Admin approval buttons in Feedback group =====
+    // callback_data format: q_approve:<uuid> / q_reject:<uuid>
+    if (action.startsWith('q_approve:') || action.startsWith('q_reject:')) {
+        const isAdmin = ADMINS.includes(ctx.from.id);
+        if (!isAdmin) return ctx.reply('❌ You are not authorized.');
+
+        const [verb, queueId] = action.split(':');
+        const approve = verb === 'q_approve';
+
+        const { data: row, error } = await supabase
+            .from('queue')
+            .select('*')
+            .eq('id', queueId)
+            .maybeSingle();
+
+        if (error || !row) return ctx.reply('⚠️ Queue item not found.');
+
+        if (row.status !== 'pending') {
+            return ctx.reply(`ℹ️ Already processed (status: ${row.status}).`);
+        }
+
+        if (approve) {
+            // publish to public group topic
+            await ctx.telegram.sendMessage(process.env.GROUP_ID, row.message, {
+            message_thread_id: TOPIC_ID
+            });
+
+            await supabase.from('queue').update({
+            status: 'approved',
+            approved_by: ctx.from.id,
+            approved_at: new Date().toISOString()
+            }).eq('id', queueId);
+
+            return ctx.editMessageReplyMarkup({ inline_keyboard: [] })
+            .catch(() => {})
+            .then(() => ctx.reply(`✅ Approved & published.`));
+        } else {
+            await supabase.from('queue').update({
+            status: 'rejected',
+            approved_by: ctx.from.id,
+            approved_at: new Date().toISOString()
+            }).eq('id', queueId);
+
+            // optional: notify user it was rejected (if you want)
+            // await ctx.telegram.sendMessage(row.user_id, '❌ Your anonymous question was not approved.');
+
+            return ctx.editMessageReplyMarkup({ inline_keyboard: [] })
+            .catch(() => {})
+            .then(() => ctx.reply(`⛔ Rejected.`));
+        }
+    }
+
 
     if (!ADMINS.includes(ctx.from.id)) return ctx.reply('❌ You are not authorized.');
 
@@ -132,7 +373,7 @@ bot.on('callback_query', async (ctx) => {
             return ctx.reply(`🧹 Successfully deleted ${deletedCount} message(s).`);
         }
         case 'admin_ban': {
-            ctx.session.mode = 'ban_waiting';
+            await setUserMode(ctx.from.id, 'ban_waiting');
             return ctx.reply('🚫 Please enter the user ID to ban:');
         }
         case 'admin_links': {
@@ -176,12 +417,18 @@ bot.on('callback_query', async (ctx) => {
     }
 });
 
-bot.start(async ctx => {
-    ctx.session = {}; // Reset mode
-    return ctx.reply(
-  '📋 Hi, this is *BJA Anonymous Messaging Bot*, which will anonymously forward your text to BJA.',
-  { ...getMainMenu(), parse_mode: 'Markdown' });    
+// bot.start(async ctx => {
+//     ctx.session = {}; // Reset mode
+//     return ctx.reply(
+//   '📋 Hi, this is *BJA Anonymous Messaging Bot*, which will anonymously forward your text to BJA.',
+//   { ...getMainMenu(), parse_mode: 'Markdown' });    
+// });
+
+bot.start(async (ctx) => {
+  return showHomeMenu(ctx);
 });
+
+
 
 bot.on(message('text'), async (ctx) => {
     if (ctx.message.chat.type !== 'private') return;
@@ -189,8 +436,8 @@ bot.on(message('text'), async (ctx) => {
     const enabled = await isBotEnabled();
     if (!enabled) return ctx.reply('🛑 Bot is currently *disabled*.', { parse_mode: 'Markdown' });
 
-    const mode = ctx.session?.mode;
     const { id: user_id, username } = ctx.from;
+    const mode = await getUserMode(user_id);
     const text = ctx.message.text?.trim();
 
     const { data: bannedUser } = await supabase
@@ -201,14 +448,48 @@ bot.on(message('text'), async (ctx) => {
 
     if (bannedUser) return ctx.reply('🚫 You are banned from using this bot.');
 
-    if (mode === 'anon') {
-        await supabase.from('messages').insert([{ user_id, username, message: text }]);
-        await ctx.telegram.sendMessage(process.env.GROUP_ID, text, {
-            message_thread_id: TOPIC_ID
-        });
-        ctx.session.mode = null;
-        return ctx.reply('✅ Your message has been sent anonymously.');
+    if (mode === 'anon_pending_approval') {
+    // store queue item
+        const { data, error } = await supabase.from('queue').insert([{
+            type: 'anon_question',
+            status: 'pending',
+            user_id,
+            username,
+            message: text,
+        }]).select().single();
+
+    if (error || !data) {
+        console.error('queue insert error:', error?.message);
+        return ctx.reply('⚠️ Failed to submit. Please try again.');
     }
+
+    const now = new Date();
+    const dateStr = now.toLocaleString('en-GB', { timeZone: 'Asia/Jerusalem' });
+
+    const pendingText =
+    `⏳ *Pending anonymous question*
+
+    🆔 User: ${user_id} (@${username || 'N/A'})
+    🕒 Date: ${dateStr}
+
+    💬 ${text}`;
+
+    await ctx.telegram.sendMessage(FEEDBACK_CHANNEL_ID, pendingText, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+        inline_keyboard: [
+            [
+            { text: '✅ Approve', callback_data: `q_approve:${data.id}` },
+            { text: '⛔ Reject', callback_data: `q_reject:${data.id}` },
+            ]
+        ]
+        }
+    });
+
+    await setUserMode(user_id, null);
+    return ctx.reply('✅ Submitted for admin approval. If approved, it will be published.');
+    }
+
 
     if (mode === 'feedback') {
         const now = new Date();
@@ -229,7 +510,7 @@ bot.on(message('text'), async (ctx) => {
             parse_mode: 'MarkdownV2'
         });
 
-        ctx.session.mode = null;
+        await setUserMode(user_id, null);
         return ctx.reply('✅ Thank you! Your feedback has been submitted.');
     }
 
@@ -238,11 +519,31 @@ bot.on(message('text'), async (ctx) => {
         if (isNaN(targetId)) return ctx.reply('⚠️ Invalid ID. Please send a valid numeric user ID.');
 
         await supabase.from('blacklist').upsert([{ user_id: targetId }]);
-        ctx.session.mode = null;
+        await setUserMode(user_id, null);
         return ctx.reply(`✅ User ${targetId} has been banned.`);
     }
 
-    ctx.reply('Please choose an option from the menu to proceed:', getMainMenu());
+    if (mode === 'contact_waiting') {
+        const now = new Date();
+        const dateStr = now.toLocaleString('en-GB', { timeZone: 'Asia/Jerusalem' });
+
+        const formatted =
+        `☎️ *Contact us form received*
+
+        👤 From: ${ctx.from.first_name || 'N/A'} (@${username || 'N/A'})
+        🆔 User ID: ${user_id}
+        🕒 Date: ${dateStr}
+
+        💬 ${text}`;
+
+        await ctx.telegram.sendMessage(FEEDBACK_CHANNEL_ID, formatted, { parse_mode: 'Markdown' });
+
+        await setUserMode(user_id, null);
+        return ctx.reply('✅ Thanks! Your message was sent to the admins.');
+    }
+
+
+    ctx.reply('Please choose an option from the menu to proceed:', getExistingUserMenu());
 });
 
 const rejectMedia = async (ctx) => {
