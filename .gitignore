@@ -1,4 +1,6 @@
 .env
 node_modules
 package-lock.json
-```
+bja-bot-*.json
+deploy-notes.md
+github-token.txt

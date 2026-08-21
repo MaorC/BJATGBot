@@ -12,6 +12,8 @@ const { Telegraf } = require('telegraf');
 const { message } = require('telegraf/filters');
 const { createClient } = require('@supabase/supabase-js');
 const dotenv = require('dotenv');
+const sheets = require('./sheets');
+const { createInterview } = require('./interview');
 
 dotenv.config();
 
@@ -30,6 +32,17 @@ const SUPA_TABLE = process.env.SUPABASE_TABLE; // Status/Config table
 const SUPA_KEY = process.env.SUPABASE_KEY_NAME; // Key for 'enabled' state
 
 /**
+ * Single source of truth for community group invite links.
+ * Used by both the join menu and the channel links post.
+ */
+const GROUP_LINKS = [
+  { text: '🛋️ Lounge', url: 'https://t.me/+V2SBxQBz0Z9hOWQ0' },
+  { text: '✈️ Commercial Aviation', url: 'https://t.me/+OszqxsBH8vY0NjBk' },
+  { text: '🧑‍🏫 Flight Instructors', url: 'https://t.me/+swR-eigAntViN2I0' },
+  { text: '👨‍✈️ Cadet Pilots', url: 'https://t.me/+8ynMfyN0zzZlNDlk' },
+];
+
+/**
  * Escapes characters for Telegram HTML parse_mode.
  */
 function escapeHTML(str) {
@@ -39,6 +52,13 @@ function escapeHTML(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
+
+const interview = createInterview({
+  supabase,
+  telegram: bot.telegram,
+  escapeHTML,
+  FEEDBACK_CHANNEL_ID,
+});
 
 
 // =============================================================================
@@ -146,19 +166,16 @@ function getFirstTimeMenu() {
 /**
  * Primary menu for registered users.
  */
-function getExistingUserMenu() {
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '❓ Ask anonymously', callback_data: 'ex_anon' }],
-        [{ text: '🗣️ Send Feedback', callback_data: 'feedback' }],
-        [{ text: '💎 Bluejay Premium', callback_data: 'ex_premium' }],
-        [{ text: '🧾 Update pilot info', callback_data: 'ex_crm' }],
-        [{ text: '☎️ Contact us', callback_data: 'ex_contact' }],
-        [{ text: '⚙️ Admin Panel', callback_data: 'admin' }],
-      ],
-    },
-  };
+function getExistingUserMenu(isAdmin = false) {
+  const keyboard = [
+    [{ text: '❓ Ask anonymously', callback_data: 'ex_anon' }],
+    [{ text: '🗣️ Send Feedback', callback_data: 'feedback' }],
+    [{ text: '💎 Bluejay Premium', callback_data: 'ex_premium' }],
+    [{ text: '🧾 Update pilot info', callback_data: 'ex_crm' }],
+    [{ text: '☎️ Contact us', callback_data: 'ex_contact' }],
+  ];
+  if (isAdmin) keyboard.push([{ text: '⚙️ Admin Panel', callback_data: 'admin' }]);
+  return { reply_markup: { inline_keyboard: keyboard } };
 }
 
 /**
@@ -168,10 +185,7 @@ function getJoinGroupsMenu() {
   return {
     reply_markup: {
       inline_keyboard: [
-        [{ text: '🛋️ Lounge', url: 'https://t.me/+V2SBxQBz0Z9hOWQ0' }],
-        [{ text: '✈️ Commercial Aviation', url: 'https://t.me/+OszqxsBH8vY0NjBk' }],
-        [{ text: '🧑‍🏫 Flight Instructors', url: 'https://t.me/+swR-eigAntViN2I0' }],
-        [{ text: '👨‍✈️ Cadet Pilots', url: 'https://t.me/+8ynMfyN0zzZlNDlk' }],
+        ...GROUP_LINKS.map(link => [link]),
         [{ text: '🔙 Back', callback_data: 'back_home' }],
       ],
     },
@@ -217,9 +231,138 @@ async function showHomeMenu(ctx) {
 
   return ctx.reply(
     '👋 Welcome back! What would you like to do?',
-    { ...getExistingUserMenu(), parse_mode: 'HTML' }
+    { ...getExistingUserMenu(ADMINS.includes(ctx.from.id)), parse_mode: 'HTML' }
   );
 }
+
+
+// =============================================================================
+// SECTION 3.5: Join Requests & Applicant Approval
+// =============================================================================
+
+/**
+ * Writes the applicant to the BJA Members sheet (update if a row already
+ * exists), admits them to the requested group, and notifies them.
+ * Sheet failures never lose data: answers stay in Supabase and admins are told.
+ */
+async function approveApplicant(applicant, adminId) {
+    const tid = applicant.telegram_id;
+    let sheetNote = '';
+
+    try {
+        const row = interview.buildSheetRow(applicant);
+        if (applicant.sheet_row) {
+            row[0] = String(applicant.member_id || '');
+            await sheets.updateMemberRow(applicant.sheet_row, row);
+        } else {
+            const { memberId, rowNumber } = await sheets.appendMemberRow(row);
+            await interview.upsertApplicant({ telegram_id: tid, member_id: memberId, sheet_row: rowNumber });
+        }
+    } catch (e) {
+        console.error('Sheets write failed:', e.message);
+        sheetNote = '\n⚠️ הכתיבה לגיליון נכשלה - הנתונים שמורים ב-Supabase, יש להעתיק ידנית.';
+    }
+
+    if (applicant.chat_requested) {
+        await bot.telegram.approveChatJoinRequest(applicant.chat_requested, tid).catch(e =>
+            console.error('approveChatJoinRequest failed:', e.message));
+    }
+
+    await interview.upsertApplicant({
+        telegram_id: tid,
+        status: 'approved',
+        decided_by: adminId || null,
+        decided_at: new Date().toISOString(),
+    });
+
+    await bot.telegram.sendMessage(tid,
+        '🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️'
+    ).catch(() => {});
+
+    return sheetNote;
+}
+
+async function rejectApplicant(applicant, adminId) {
+    await interview.upsertApplicant({
+        telegram_id: applicant.telegram_id,
+        status: 'rejected',
+        decided_by: adminId,
+        decided_at: new Date().toISOString(),
+    });
+
+    if (applicant.chat_requested) {
+        await bot.telegram.declineChatJoinRequest(applicant.chat_requested, applicant.telegram_id).catch(() => {});
+    }
+
+    await bot.telegram.sendMessage(applicant.telegram_id,
+        '🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה. לבירור או ערעור ניתן לפנות בהודעה פרטית ל-@maor_c'
+    ).catch(() => {});
+}
+
+bot.on('chat_join_request', async (ctx) => {
+    const req = ctx.chatJoinRequest;
+    const userId = req.from.id;
+    const chatId = req.chat.id;
+
+    try {
+        // Banned users: silent decline
+        const { data: banned } = await supabase.from('blacklist').select('user_id').eq('user_id', userId).maybeSingle();
+        if (banned) return ctx.telegram.declineChatJoinRequest(chatId, userId).catch(() => {});
+
+        let applicant = await interview.getApplicant(userId);
+
+        // Previously rejected: auto-decline, point to @maor_c, no re-interview
+        if (applicant?.status === 'rejected') {
+            await ctx.telegram.declineChatJoinRequest(chatId, userId).catch(() => {});
+            return ctx.telegram.sendMessage(userId,
+                '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור ניתן לפנות בהודעה פרטית ל-@maor_c'
+            ).catch(() => {});
+        }
+
+        // Already an approved member (e.g. joining another BJA group): straight in
+        if (applicant?.status === 'approved') {
+            await ctx.telegram.approveChatJoinRequest(chatId, userId).catch(() => {});
+            return ctx.telegram.sendMessage(userId, '🔵 ברוך הבא! אושרת אוטומטית כחבר קהילה קיים ✈️').catch(() => {});
+        }
+
+        // Retro-approved: admit; complete any missing questions first
+        if (applicant?.status === 'retro_pending') {
+            applicant = await interview.upsertApplicant({ telegram_id: userId, chat_requested: chatId });
+            if (interview.nextQuestion(applicant) === null) {
+                await approveApplicant(applicant, null);
+            } else {
+                await ctx.telegram.sendMessage(userId, '🔵 כמעט שם! נשארו כמה פרטים קצרים להשלמה:').catch(() => {});
+                await interview.advance(userId, applicant);
+            }
+            return;
+        }
+
+        // Interview already submitted, still under review
+        if (applicant?.status === 'submitted') {
+            await interview.upsertApplicant({ telegram_id: userId, chat_requested: chatId });
+            return ctx.telegram.sendMessage(userId,
+                '🔵 הבקשה שלך כבר אצל הצוות ותיענה בתוך 24 שעות לכל היותר. תודה על הסבלנות!'
+            ).catch(() => {});
+        }
+
+        // New applicant (or resuming an unfinished interview)
+        applicant = await interview.upsertApplicant({
+            telegram_id: userId,
+            username: req.from.username || null,
+            tg_first_name: req.from.first_name || null,
+            chat_requested: chatId,
+            status: 'in_progress',
+        });
+
+        if (!applicant) return;
+        await ctx.telegram.sendMessage(userId, interview.INTRO_MSG).catch(e => {
+            console.error('Cannot DM applicant:', e.message);
+        });
+        await interview.advance(userId, applicant);
+    } catch (e) {
+        console.error('chat_join_request error:', e);
+    }
+});
 
 
 // =============================================================================
@@ -228,15 +371,92 @@ async function showHomeMenu(ctx) {
 
 bot.on('callback_query', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch (e) {}
-    
+
     const action = ctx.callbackQuery.data;
     const userId = ctx.from.id;
+    const isAdmin = ADMINS.includes(userId);
+
+    // --- Guards (same as text handler; admins bypass the enabled check) ---
+    if (!isAdmin) {
+        const { data: banned } = await supabase.from('blacklist').select('user_id').eq('user_id', userId).maybeSingle();
+        if (banned) return ctx.reply('🚫 You are banned.');
+
+        const enabled = await isBotEnabled();
+        if (!enabled) return ctx.reply('🛑 Bot is currently disabled.');
+    }
+
+    // --- Interview answers (applicant, or admin in fill mode) ---
+    if (action.startsWith('iv:')) {
+        try {
+            let target = null;
+            let fillOpts = {};
+            const mode = await getUserMode(userId);
+            if (isAdmin && mode?.startsWith('fill:')) {
+                target = await interview.getApplicant(parseInt(mode.slice(5)));
+                fillOpts = { fillMode: true, adminId: userId };
+            } else {
+                target = await interview.getApplicant(userId);
+            }
+            if (!target) return;
+            await interview.handleCallback(ctx, target, fillOpts);
+        } catch (e) {
+            console.error('interview callback error:', e);
+        }
+        return;
+    }
+
+    // --- Admin decisions on applicants ---
+    if (action.startsWith('aq:')) {
+        if (!isAdmin) return ctx.reply('❌ Unauthorized.');
+        const [, verb, tidStr] = action.split(':');
+        const applicant = await interview.getApplicant(parseInt(tidStr));
+        if (!applicant) return ctx.reply('⚠️ מועמד לא נמצא.');
+
+        try {
+            if (verb === 'app') {
+                if (applicant.status === 'approved') return ctx.reply('ℹ️ כבר אושר.');
+                const note = await approveApplicant(applicant, userId);
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                return ctx.reply(`✅ ${applicant.answers?.name || tidStr} אושר ונוסף לגיליון.${note}`);
+            }
+            if (verb === 'rej') {
+                if (applicant.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
+                await rejectApplicant(applicant, userId);
+                await ctx.editMessageReplyMarkup({
+                    inline_keyboard: [[
+                        { text: '↩️ אשר בדיעבד', callback_data: `aq:retro:${tidStr}` },
+                        { text: '📋 השלמה ידנית', callback_data: `aq:fill:${tidStr}` },
+                    ]],
+                }).catch(() => {});
+                return ctx.reply(`⛔ ${applicant.answers?.name || tidStr} סורב. ניתן לאשר בדיעבד מהכרטיס.`);
+            }
+            if (verb === 'retro') {
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, status: 'retro_pending' });
+                await ctx.telegram.sendMessage(applicant.telegram_id,
+                    '🔵 עדכון מצוות Blue Jay Aviation: בקשתך אושרה!\n\nבחר קבוצה להצטרפות:',
+                    getJoinGroupsMenu()
+                ).catch(() => {});
+                return ctx.reply('↩️ המועמד קיבל לינק הצטרפות. בכניסה הבאה שלו הוא יאושר אוטומטית (כולל השלמת פרטים חסרים אם יש).');
+            }
+            if (verb === 'fill') {
+                await supabase.from('users').upsert([{ user_id: userId, chat_mode: `fill:${tidStr}` }], { onConflict: 'user_id' });
+                const missing = interview.nextQuestion(applicant);
+                if (!missing) return ctx.reply('ℹ️ אין פרטים חסרים למועמד הזה. אפשר לאשר ישירות.');
+                await ctx.telegram.sendMessage(userId, `📋 השלמה ידנית עבור ${applicant.answers?.name || applicant.tg_first_name || tidStr}.\nלביטול בכל שלב: /cancel`).catch(() => {});
+                await interview.advance(userId, applicant, { fillMode: true, adminId: userId });
+                return ctx.reply('📋 נשלחו אליך השאלות החסרות בצ\'אט הפרטי עם הבוט.');
+            }
+        } catch (e) {
+            console.error('admin queue action error:', e);
+            return ctx.reply('⚠️ שגיאה בביצוע הפעולה, נסה שוב.');
+        }
+    }
 
     // --- Basic Navigation ---
     if (action === 'back_home') return showHomeMenu(ctx);
     
     if (action === 'admin') {
-        if (!ADMINS.includes(userId)) return ctx.reply('❌ You are not authorized.');
+        if (!isAdmin) return ctx.reply('❌ You are not authorized.');
         return ctx.reply('🔧 Admin Panel:', getAdminPanel());
     }
 
@@ -280,7 +500,7 @@ bot.on('callback_query', async (ctx) => {
 
     // --- Admin Queue Handling ---
     if (action.startsWith('q_approve:') || action.startsWith('q_reject:')) {
-        if (!ADMINS.includes(userId)) return ctx.reply('❌ Unauthorized.');
+        if (!isAdmin) return ctx.reply('❌ Unauthorized.');
 
         const [verb, queueId] = action.split(':');
         const isApproval = verb === 'q_approve';
@@ -303,7 +523,7 @@ bot.on('callback_query', async (ctx) => {
     }
 
     // --- Admin Panel Actions ---
-    if (!ADMINS.includes(userId)) return;
+    if (!isAdmin) return;
 
     switch (action) {
         case 'admin_on':
@@ -328,16 +548,11 @@ bot.on('callback_query', async (ctx) => {
             await setUserMode(userId, 'ban_waiting');
             return ctx.reply('🚫 Enter user ID to ban:');
         case 'admin_links':
-            const linkText = `ברוכים הבאים לערוץ <b>Blue Jay Aviation</b>!\n\n📌 <b>הקבוצות שלנו:</b> ...`; 
+            const linkText = `🔵 ברוכים הבאים לערוץ <b>Blue Jay Aviation</b>!\n\n📌 <b>הקבוצות שלנו</b> - לחצו על הכפתורים למטה כדי להצטרף:\n\nטיסות בטוחות! ✈️`;
             await ctx.telegram.sendMessage(parseInt(CHANNEL_ID), linkText, {
                 parse_mode: 'HTML',
                 reply_markup: {
-                    inline_keyboard: [
-                        [{ text: ' Couch Lounge', url: 'https://t.me/+V2SBxQBz0Z9hOWQ0' }],
-                        [{ text: ' Airplane Commercial Aviation', url: 'https://t.me/+OszqxsBH8vY0NjBk' }],
-                        [{ text: ' Teacher Flight Instructors', url: 'https://t.me/+swR-eigAntViN2I0' }],
-                        [{ text: ' Pilot Cadet Pilots', url: 'https://t.me/+8ynMfyN0zzZlNDlk' }]
-                    ]
+                    inline_keyboard: GROUP_LINKS.map(link => [link])
                 }
             });
             return ctx.reply('✅ Links posted to channel.');
@@ -364,6 +579,28 @@ bot.on(message('text'), async (ctx) => {
     // --- Blacklist Check ---
     const { data: banned } = await supabase.from('blacklist').select('user_id').eq('user_id', userId).maybeSingle();
     if (banned) return ctx.reply('🚫 You are banned.');
+
+    // --- Flow: Admin fill mode (completing an applicant's details) ---
+    if (ADMINS.includes(userId) && mode?.startsWith('fill:')) {
+        if (text === '/cancel') {
+            await setUserMode(userId, null);
+            return ctx.reply('בוטל. ✔️');
+        }
+        const target = await interview.getApplicant(parseInt(mode.slice(5)));
+        if (target) {
+            const consumed = await interview.handleText(ctx, target, text, { fillMode: true, adminId: userId });
+            if (consumed) return;
+        }
+    }
+
+    // --- Flow: Join interview (free-text answers) ---
+    {
+        const applicant = await interview.getApplicant(userId);
+        if (applicant?.state) {
+            const consumed = await interview.handleText(ctx, applicant, text, {});
+            if (consumed) return;
+        }
+    }
 
     // --- Flow: Anonymous Question Submission ---
     if (mode === 'anon_pending_approval') {
@@ -414,6 +651,29 @@ bot.on(message('text'), async (ctx) => {
         return ctx.reply('✅ Message sent to admins.');
     }
 
+    // --- Flow: Pilot Info Update (CRM) ---
+    if (mode === 'crm_waiting') {
+        const { error } = await supabase.from('queue').insert([{
+            type: 'crm_update',
+            status: 'pending',
+            user_id: userId,
+            username,
+            message: text,
+        }]);
+
+        if (error) {
+            console.error('CRM insert error:', error.message);
+            return ctx.reply('⚠️ Submission failed. Please try again.');
+        }
+
+        const dateStr = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jerusalem' });
+        const report = `🧾 <b>Pilot Info Update</b>\n\n👤 From: ${escapeHTML(ctx.from.first_name)} (@${escapeHTML(username)})\n🆔 ID: ${userId}\n🕒 Date: ${dateStr}\n\n💬 ${escapeHTML(text)}`;
+
+        await ctx.telegram.sendMessage(FEEDBACK_CHANNEL_ID, report, { parse_mode: 'HTML' });
+        await setUserMode(userId, null);
+        return ctx.reply('✅ Thanks! Your info was sent to the team and will be updated in our records.');
+    }
+
     // --- Flow: Admin Ban Action ---
     if (mode === 'ban_waiting' && ADMINS.includes(userId)) {
         const targetId = parseInt(text);
@@ -424,13 +684,32 @@ bot.on(message('text'), async (ctx) => {
     }
 
     // Default: Show Menu
-    ctx.reply('Please choose an option from the menu:', getExistingUserMenu());
+    ctx.reply('Please choose an option from the menu:', getExistingUserMenu(ADMINS.includes(userId)));
 });
 
 
 // =============================================================================
 // SECTION 6: Media Handlers & Lifecycle
 // =============================================================================
+
+// Shared contact = phone answer during the join interview
+bot.on(message('contact'), async (ctx) => {
+    if (ctx.message.chat.type !== 'private') return;
+    try {
+        const userId = ctx.from.id;
+        const mode = await getUserMode(userId);
+        let target, fillOpts = {};
+        if (ADMINS.includes(userId) && mode?.startsWith('fill:')) {
+            target = await interview.getApplicant(parseInt(mode.slice(5)));
+            fillOpts = { fillMode: true, adminId: userId };
+        } else {
+            target = await interview.getApplicant(userId);
+        }
+        if (target) await interview.handleContact(ctx, target, fillOpts);
+    } catch (e) {
+        console.error('contact handler error:', e);
+    }
+});
 
 const rejectMedia = async (ctx) => {
     if (ctx.message.chat.type === 'private') ctx.reply('Text messages only, please!');
@@ -448,8 +727,10 @@ exports.bot = bot;
 exports.handler = async event => {
     try {
         await bot.handleUpdate(JSON.parse(event.body));
-        return { statusCode: 200, body: "" };
     } catch (e) {
-        return { statusCode: 400, body: "Webhook Error" };
+        // Always return 200: a non-2xx response makes Telegram re-deliver the
+        // same update repeatedly, causing duplicate processing.
+        console.error('Webhook error:', e);
     }
+    return { statusCode: 200, body: "" };
 };

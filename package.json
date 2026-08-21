@@ -8,9 +8,9 @@
     },
     "dependencies": {
         "@supabase/supabase-js": "^2.49.8",
-        "dotenv": "^6.0.0",
+        "dotenv": "^16.4.5",
+        "google-auth-library": "^9.15.0",
         "netlify-lambda": "^2.0.16",
-        "telegraf": "^4.4.2",
-        "telegraph-node": "^1.0.0"
+        "telegraf": "^4.16.3"
     }
 }
