@@ -170,7 +170,7 @@ function getExistingUserMenu(isAdmin = false) {
   const keyboard = [
     [{ text: '❓ Ask anonymously', callback_data: 'ex_anon' }],
     [{ text: '🗣️ Send Feedback', callback_data: 'feedback' }],
-    [{ text: '💎 Bluejay Premium', callback_data: 'ex_premium' }],
+    // 'ex_premium' (Bluejay Premium) hidden until real onboarding copy is ready - see project memory.
     [{ text: '🧾 Update pilot info', callback_data: 'ex_crm' }],
     [{ text: '☎️ Contact us', callback_data: 'ex_contact' }],
   ];
