@@ -40,6 +40,7 @@ const GROUP_LINKS = [
   { text: '✈️ Commercial Aviation', url: 'https://t.me/+OszqxsBH8vY0NjBk' },
   { text: '🧑‍🏫 Flight Instructors', url: 'https://t.me/+swR-eigAntViN2I0' },
   { text: '👨‍✈️ Cadet Pilots', url: 'https://t.me/+8ynMfyN0zzZlNDlk' },
+  { text: '💪 Fit2Fly (Fitness Squad)', url: 'https://t.me/+JGTG3PlkZ1M3ODRk' },
 ];
 
 /**
@@ -295,7 +296,8 @@ async function rejectApplicant(applicant, adminId) {
     }
 
     await bot.telegram.sendMessage(applicant.telegram_id,
-        '🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה. לבירור או ערעור ניתן לפנות בהודעה פרטית ל-@maor_c'
+        '🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה. לבירור או ערעור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
+        { parse_mode: 'HTML' }
     ).catch(() => {});
 }
 
@@ -315,7 +317,8 @@ bot.on('chat_join_request', async (ctx) => {
         if (applicant?.status === 'rejected') {
             await ctx.telegram.declineChatJoinRequest(chatId, userId).catch(() => {});
             return ctx.telegram.sendMessage(userId,
-                '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור ניתן לפנות בהודעה פרטית ל-@maor_c'
+                '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
+                { parse_mode: 'HTML' }
             ).catch(() => {});
         }
 
@@ -497,7 +500,7 @@ bot.on('callback_query', async (ctx) => {
 
 הפרות יטופלו על ידי הצוות, ובמקרים חמורים עלולות להוביל להרחקה מהקהילה.
 
-💬 יש שאלה או משהו לא ברור? פנו לאחד האדמינים - אפשר לתייג את @maor_c ליצירת קשר ישיר.`,
+💬 יש שאלה או משהו לא ברור? פנו לאחד האדמינים, או <a href="tg://user?id=382965373">לחצו כאן ליצירת קשר ישיר עם מאור</a>.`,
             { parse_mode: 'HTML' }
         );
     }

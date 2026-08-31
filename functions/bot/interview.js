@@ -82,7 +82,7 @@ const INTRO_MSG =
 const CLOSING_MSG =
     '🔵 תודה! הבקשה הועברה לצוות BJA.\n\n' +
     '⏱️ בתוך 24 שעות לכל היותר הבקשה תאושר או תסורב בהתאם לתשובות.\n' +
-    '💬 לערעור או כל שאלה - הודעה פרטית ל-@maor_c\n\n' +
+    '💬 לערעור או כל שאלה - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>\n\n' +
     'טיסות בטוחות! ✈️';
 
 const VERIFICATION_MSG =
@@ -286,7 +286,7 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID }
             submitted_at: new Date().toISOString(),
         });
 
-        await telegram.sendMessage(chatId, CLOSING_MSG, { reply_markup: { remove_keyboard: true } });
+        await telegram.sendMessage(chatId, CLOSING_MSG, { parse_mode: 'HTML', reply_markup: { remove_keyboard: true } });
         if (needsVerification) await telegram.sendMessage(chatId, VERIFICATION_MSG);
 
         await sendAdminCard(applicant.telegram_id);
