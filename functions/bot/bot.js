@@ -358,9 +358,25 @@ bot.on('chat_join_request', async (ctx) => {
         });
 
         if (!applicant) return;
-        await ctx.telegram.sendMessage(userId, interview.INTRO_MSG).catch(e => {
+        try {
+            await ctx.telegram.sendMessage(userId, interview.INTRO_MSG);
+        } catch (e) {
+            // Most likely cause: this user has never opened a chat with the bot,
+            // so Telegram won't let us DM them (403 "bot can't initiate conversation").
+            // Don't call interview.advance() - it would just fail silently the same way.
+            // Leave their join request pending in Telegram and flag it for a human.
             console.error('Cannot DM applicant:', e.message);
-        });
+            const name = escapeHTML(req.from.first_name || '');
+            const uname = req.from.username ? `@${escapeHTML(req.from.username)}` : 'אין יוזרנייס';
+            await bot.telegram.sendMessage(FEEDBACK_CHANNEL_ID,
+                `⚠️ <b>לא הצלחנו ליצור קשר עם מועמד חדש</b>\n\n` +
+                `👤 ${name} (${uname})\n` +
+                `🆔 ${userId}\n\n` +
+                `הבקשה שלו נשארת ממתינה בטלגרם, אבל לא הצלחנו לשלוח לו הודעה פרטית - קרוב לוודאי כי הוא מעולם לא פתח שיחה עם הבוט. יש לבקש ממנו (למשל דרך מי שהפנה אותו, או הודעה אישית אם אפשר) ללחוץ קודם /start לבוט, ואז לנסות שוב להצטרף.`,
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+            return;
+        }
         await interview.advance(userId, applicant);
     } catch (e) {
         console.error('chat_join_request error:', e);
