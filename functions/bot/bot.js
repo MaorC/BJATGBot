@@ -5,7 +5,12 @@
  * 1. Users start the bot and are identified as first-time or existing users.
  * 2. Navigation is handled via inline keyboards and state stored in Supabase (chat_mode).
  * 3. Anonymous questions are queued for admin approval before being published to the main group.
- * 4. Join requests are now handled natively by Telegram via direct invite links.
+ * 4. Join requests: every "join a group" entry point (channel post, in-bot menu) routes
+ *    through the bot first via startJoinFlow() - either a /start deep-link payload
+ *    (join_<key>) or an in-bot picker button - which guarantees the user has opened a
+ *    chat with the bot before the interview DM is attempted, and only then hands out the
+ *    real group invite link. The native chat_join_request handler below stays in place as
+ *    a fallback safety net for anyone who still arrives via an old/raw invite link.
  */
 
 const { Telegraf } = require('telegraf');
@@ -31,16 +36,21 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const SUPA_TABLE = process.env.SUPABASE_TABLE; // Status/Config table
 const SUPA_KEY = process.env.SUPABASE_KEY_NAME; // Key for 'enabled' state
 
+const BOT_USERNAME = 'BlueJayAviationBot';
+
 /**
- * Single source of truth for community group invite links.
- * Used by both the join menu and the channel links post.
+ * Single source of truth for community groups. `key` is the stable slug used
+ * in /start deep-link payloads (join_<key>) and in-bot picker callback data
+ * (join_pick:<key>) - never expose the raw `url` directly in the channel post
+ * or the in-bot picker; route through startJoinFlow() instead so every path
+ * to a group goes through the bot first.
  */
 const GROUP_LINKS = [
-  { text: '🛋️ Lounge', url: 'https://t.me/+V2SBxQBz0Z9hOWQ0' },
-  { text: '✈️ Commercial Aviation', url: 'https://t.me/+OszqxsBH8vY0NjBk' },
-  { text: '🧑‍🏫 Flight Instructors', url: 'https://t.me/+swR-eigAntViN2I0' },
-  { text: '👨‍✈️ Cadet Pilots', url: 'https://t.me/+8ynMfyN0zzZlNDlk' },
-  { text: '💪 Fit2Fly (Fitness Squad)', url: 'https://t.me/+JGTG3PlkZ1M3ODRk' },
+  { key: 'lounge', text: '🛋️ Lounge', url: 'https://t.me/+V2SBxQBz0Z9hOWQ0' },
+  { key: 'commercial', text: '✈️ Commercial Aviation', url: 'https://t.me/+OszqxsBH8vY0NjBk' },
+  { key: 'instructors', text: '🧑‍🏫 Flight Instructors', url: 'https://t.me/+swR-eigAntViN2I0' },
+  { key: 'cadets', text: '👨‍✈️ Cadet Pilots', url: 'https://t.me/+8ynMfyN0zzZlNDlk' },
+  { key: 'fit2fly', text: '💪 Fit2Fly (Fitness Squad)', url: 'https://t.me/+JGTG3PlkZ1M3ODRk' },
 ];
 
 /**
@@ -169,6 +179,7 @@ function getFirstTimeMenu() {
  */
 function getExistingUserMenu(isAdmin = false) {
   const keyboard = [
+    [{ text: '🛫 Request to join another group', callback_data: 'ft_join' }],
     [{ text: '❓ Ask anonymously', callback_data: 'ex_anon' }],
     [{ text: '🗣️ Send Feedback', callback_data: 'feedback' }],
     // 'ex_premium' (Bluejay Premium) hidden until real onboarding copy is ready - see project memory.
@@ -180,13 +191,15 @@ function getExistingUserMenu(isAdmin = false) {
 }
 
 /**
- * Direct Telegram invite links for community groups.
+ * In-bot group picker. Buttons call back into the bot (join_pick:<key>)
+ * rather than linking straight to the group, so every join always goes
+ * through startJoinFlow() first.
  */
-function getJoinGroupsMenu() {
+function getGroupPickerMenu() {
   return {
     reply_markup: {
       inline_keyboard: [
-        ...GROUP_LINKS.map(link => [link]),
+        ...GROUP_LINKS.map(g => [{ text: g.text, callback_data: `join_pick:${g.key}` }]),
         [{ text: '🔙 Back', callback_data: 'back_home' }],
       ],
     },
@@ -264,9 +277,14 @@ async function approveApplicant(applicant, adminId) {
         sheetNote = '\n⚠️ הכתיבה לגיליון נכשלה - הנתונים שמורים ב-Supabase, יש להעתיק ידנית.';
     }
 
+    let admittedDirectly = false;
     if (applicant.chat_requested) {
-        await bot.telegram.approveChatJoinRequest(applicant.chat_requested, tid).catch(e =>
-            console.error('approveChatJoinRequest failed:', e.message));
+        try {
+            await bot.telegram.approveChatJoinRequest(applicant.chat_requested, tid);
+            admittedDirectly = true;
+        } catch (e) {
+            console.error('approveChatJoinRequest failed:', e.message);
+        }
     }
 
     await interview.upsertApplicant({
@@ -276,9 +294,23 @@ async function approveApplicant(applicant, adminId) {
         decided_at: new Date().toISOString(),
     });
 
-    await bot.telegram.sendMessage(tid,
-        '🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️'
-    ).catch(() => {});
+    // If there was a real pending Telegram join request, approveChatJoinRequest above
+    // already admitted them and no link is needed. Otherwise (the bot-first flow -
+    // startJoinFlow) they were never actually issued a Telegram join request, so send
+    // the real invite link for the specific group they asked for.
+    const groupKey = applicant.answers?.requested_group_key;
+    const group = groupKey ? GROUP_LINKS.find(g => g.key === groupKey) : null;
+
+    if (admittedDirectly || !group) {
+        await bot.telegram.sendMessage(tid,
+            '🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️'
+        ).catch(() => {});
+    } else {
+        await bot.telegram.sendMessage(tid,
+            `🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nלחץ כדי להצטרף ל-${group.text}:`,
+            { reply_markup: { inline_keyboard: [[{ text: group.text, url: group.url }]] } }
+        ).catch(() => {});
+    }
 
     return sheetNote;
 }
@@ -299,6 +331,85 @@ async function rejectApplicant(applicant, adminId) {
         '🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה. לבירור או ערעור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
         { parse_mode: 'HTML' }
     ).catch(() => {});
+}
+
+/**
+ * Entry point for any "request to join a group" action - reached either via
+ * a bot deep-link (/start join_<key>, e.g. from the channel post) or an
+ * in-bot picker button (join_pick:<key>, from getGroupPickerMenu()). Both
+ * paths guarantee the user has opened a chat with the bot before any
+ * interview DM is attempted - the gap that let a real applicant's join
+ * request go unanswered when they never messaged the bot first.
+ */
+async function startJoinFlow(ctx, key) {
+    const group = GROUP_LINKS.find(g => g.key === key);
+    if (!group) return ctx.reply('⚠️ קבוצה לא נמצאה, נסה שוב מהתפריט.');
+
+    const userId = ctx.from.id;
+    await ensureUserRow(ctx);
+
+    const { data: banned } = await supabase.from('blacklist').select('user_id').eq('user_id', userId).maybeSingle();
+    if (banned) return ctx.reply('🚫 You are banned.');
+
+    let applicant = await interview.getApplicant(userId);
+
+    // Previously rejected: no re-interview, point to Maor
+    if (applicant?.status === 'rejected') {
+        return ctx.reply(
+            '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    // Already an approved member (e.g. joining another BJA group): straight to the real link
+    if (applicant?.status === 'approved') {
+        return ctx.reply(
+            `🔵 אתה כבר חבר מאושר בקהילה! לחץ כדי להצטרף ל-${group.text}:`,
+            { reply_markup: { inline_keyboard: [[{ text: group.text, url: group.url }]] } }
+        );
+    }
+
+    // Retro-approved: admit once any missing questions are completed
+    if (applicant?.status === 'retro_pending') {
+        applicant = await interview.upsertApplicant({
+            telegram_id: userId,
+            answers: { ...(applicant.answers || {}), requested_group_key: key },
+        });
+        if (interview.nextQuestion(applicant) === null) {
+            await approveApplicant(applicant, null);
+        } else {
+            await ctx.reply('🔵 כמעט שם! נשארו כמה פרטים קצרים להשלמה:');
+            await interview.advance(userId, applicant);
+        }
+        return;
+    }
+
+    // Interview already submitted, still under review
+    if (applicant?.status === 'submitted') {
+        return ctx.reply('🔵 הבקשה שלך כבר אצל הצוות ותיענה בתוך 24 שעות לכל היותר. תודה על הסבלנות!');
+    }
+
+    // New applicant, or resuming an unfinished interview
+    const isNew = !applicant;
+    applicant = await interview.upsertApplicant({
+        telegram_id: userId,
+        username: ctx.from.username || null,
+        tg_first_name: ctx.from.first_name || null,
+        status: 'in_progress',
+        answers: { ...(applicant?.answers || {}), requested_group_key: key },
+    });
+    if (!applicant) return;
+
+    if (isNew) {
+        await ctx.reply(
+            `👋 היי! שמח/ה שהתעניינת להצטרף ל-${group.text} בקהילת Blue Jay Aviation.\n\n` +
+            `Blue Jay Aviation היא קהילה של כ-400 טייסים מקצועיים - ליווי ממנטורים, מאגר ידע, וקשר ישיר לטייסים מובילים בתעופה. (המידע המלא זמין בכפתור "About us" בתפריט בכל שלב)`
+        );
+        await ctx.reply(interview.INTRO_MSG);
+    } else {
+        await ctx.reply('🔵 ממשיכים מהיכן שעצרנו:');
+    }
+    await interview.advance(userId, applicant);
 }
 
 bot.on('chat_join_request', async (ctx) => {
@@ -453,9 +564,9 @@ bot.on('callback_query', async (ctx) => {
                 await interview.upsertApplicant({ telegram_id: applicant.telegram_id, status: 'retro_pending' });
                 await ctx.telegram.sendMessage(applicant.telegram_id,
                     '🔵 עדכון מצוות Blue Jay Aviation: בקשתך אושרה!\n\nבחר קבוצה להצטרפות:',
-                    getJoinGroupsMenu()
+                    getGroupPickerMenu()
                 ).catch(() => {});
-                return ctx.reply('↩️ המועמד קיבל לינק הצטרפות. בכניסה הבאה שלו הוא יאושר אוטומטית (כולל השלמת פרטים חסרים אם יש).');
+                return ctx.reply('↩️ המועמד קיבל תפריט בחירת קבוצה להצטרפות. בבחירה הבאה שלו הוא יאושר אוטומטית (כולל השלמת פרטים חסרים אם יש).');
             }
             if (verb === 'fill') {
                 await supabase.from('users').upsert([{ user_id: userId, chat_mode: `fill:${tidStr}` }], { onConflict: 'user_id' });
@@ -473,7 +584,11 @@ bot.on('callback_query', async (ctx) => {
 
     // --- Basic Navigation ---
     if (action === 'back_home') return showHomeMenu(ctx);
-    
+
+    if (action.startsWith('join_pick:')) {
+        return startJoinFlow(ctx, action.slice('join_pick:'.length));
+    }
+
     if (action === 'admin') {
         if (!isAdmin) return ctx.reply('❌ You are not authorized.');
         return ctx.reply('🔧 Admin Panel:', getAdminPanel());
@@ -521,7 +636,7 @@ bot.on('callback_query', async (ctx) => {
         );
     }
     if (action === 'ft_join') {
-        return ctx.reply('🛫 Choose the group you want to request joining:', getJoinGroupsMenu());
+        return ctx.reply('🛫 Choose the group you want to request joining:', getGroupPickerMenu());
     }
 
     // --- User Features ---
@@ -595,11 +710,11 @@ bot.on('callback_query', async (ctx) => {
             await setUserMode(userId, 'ban_waiting');
             return ctx.reply('🚫 Enter user ID to ban:');
         case 'admin_links':
-            const linkText = `🔵 ברוכים הבאים לערוץ <b>Blue Jay Aviation</b>!\n\n📌 <b>הקבוצות שלנו</b> - לחצו על הכפתורים למטה כדי להצטרף:\n\nטיסות בטוחות! ✈️`;
+            const linkText = `🔵 ברוכים הבאים לערוץ <b>Blue Jay Aviation</b>!\n\n📌 <b>הקבוצות שלנו</b> - לחצו על הקבוצה שמעניינת אתכם כדי להתחיל תהליך הצטרפות קצר דרך הבוט:\n\nטיסות בטוחות! ✈️`;
             await ctx.telegram.sendMessage(parseInt(CHANNEL_ID), linkText, {
                 parse_mode: 'HTML',
                 reply_markup: {
-                    inline_keyboard: GROUP_LINKS.map(link => [link])
+                    inline_keyboard: GROUP_LINKS.map(g => [{ text: g.text, url: `https://t.me/${BOT_USERNAME}?start=join_${g.key}` }])
                 }
             });
             return ctx.reply('✅ Links posted to channel.');
@@ -611,7 +726,16 @@ bot.on('callback_query', async (ctx) => {
 // SECTION 5: Text Message Handlers
 // =============================================================================
 
-bot.start(async (ctx) => showHomeMenu(ctx));
+bot.start(async (ctx) => {
+    const payload = ctx.startPayload; // text after "/start ", e.g. join_lounge from a deep-link
+    if (payload && payload.startsWith('join_')) {
+        const key = payload.slice('join_'.length);
+        if (GROUP_LINKS.some(g => g.key === key)) {
+            return startJoinFlow(ctx, key);
+        }
+    }
+    return showHomeMenu(ctx);
+});
 
 bot.on(message('text'), async (ctx) => {
     if (ctx.message.chat.type !== 'private') return;
