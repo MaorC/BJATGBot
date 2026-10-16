@@ -71,6 +71,26 @@ const RATING_OPTS = [
 
 const sheetValue = (opts, code) => (opts.find(o => o[0] === code) || [])[2] || '';
 const hebLabel = (opts, code) => (opts.find(o => o[0] === code) || [])[1] || code;
+const categoryLabel = (code) => hebLabel(CATEGORY_OPTS, code);
+
+// --- Group/category mismatch (Commercial Aviation = flies commercially, not just "holds a CPL") ---
+
+const COMMERCIAL_CATEGORIES = ['air', 'cargo', 'biz', 'ga'];
+
+/** True when a requested group's intended audience doesn't match the applicant's stated flying category. */
+function isCommercialMismatch(groupKey, category) {
+    if (groupKey !== 'commercial') return false;
+    if (!category) return false;
+    return !COMMERCIAL_CATEGORIES.includes(category);
+}
+
+const GROUP_MISMATCH_NUDGE_INTERVIEW =
+    '✈️ שים/י לב - קבוצת Commercial Aviation מיועדת לטייסים שעובדים בתעופה מסחרית בפועל (איירליין, ג\'ט פרטי, תובלה, צילום אווירי ועוד), לא רק למי שמחזיק רישיון CPL.\n\n' +
+    'לא צריך לעשות כלום כרגע - ממשיכים עם הבקשה, והצוות יבדוק את ההתאמה בסקירה.';
+
+const GROUP_MISMATCH_NUDGE_EXTRA =
+    '✈️ שים/י לב - קבוצת Commercial Aviation מיועדת לטייסים שעובדים בתעופה מסחרית בפועל, לא רק למי שמחזיק רישיון CPL.\n\n' +
+    'הבקשה הועברה לצוות לבדיקה קצרה, תקבל/י עדכון בקרוב.';
 
 // --- Copy ---
 
@@ -90,7 +110,9 @@ const VERIFICATION_MSG =
 
 // --- Factory ---
 
-function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID }) {
+function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, GROUP_LINKS = [] }) {
+
+    const groupLabel = (key) => (GROUP_LINKS.find(g => g.key === key) || {}).text || key;
 
     // ---------- DB helpers ----------
 
@@ -269,6 +291,9 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID }
         const reasons = [];
         if (a.phone === '') reasons.push('לא שותף מספר טלפון');
         if (a.extra === '') reasons.push('דילג על פרטים נוספים');
+        if (isCommercialMismatch(a.requested_group_key, a.category)) {
+            reasons.push('ביקש/ה Commercial Aviation אך הסטטוס אינו מצביע על טיסה מסחרית בפועל - לבדוק התאמה');
+        }
         return reasons;
     }
 
@@ -299,12 +324,14 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID }
             ``,
             `👤 ${escapeHTML(a.name)} (@${escapeHTML(applicant.username || 'אין')})`,
             `🆔 ${applicant.telegram_id}`,
+            `💬 <a href="tg://user?id=${applicant.telegram_id}">פנייה ישירה למועמד</a>`,
             `📱 ${a.phone ? escapeHTML(a.phone) : 'לא שותף'}`,
             `🌍 מגורים: ${a.residency === 'other' ? escapeHTML(a.residency_other || '?') : hebLabel(RESIDENCY_OPTS, a.residency)}`,
             `✈️ סטטוס: ${a.category === 'other' ? escapeHTML(a.category_other || '?') : hebLabel(CATEGORY_OPTS, a.category)}`,
             `📜 רישיון: ${a.license === 'other' ? escapeHTML(a.license_other || '?') : hebLabel(LICENSE_OPTS, a.license)}` +
                 (a.authorities?.length ? ` (${a.authorities.map(c => sheetValue(AUTH_OPTS, c)).join(', ')}${a.authority_other ? ', ' + escapeHTML(a.authority_other) : ''})` : ''),
         ];
+        if (a.requested_group_key) lines.push(`🎯 מבקש/ת להצטרף ל: ${groupLabel(a.requested_group_key)}`);
         if (a.training) lines.push(`🎯 במסלול ל: ${a.training === 'other' ? escapeHTML(a.training_other || '?') : hebLabel(TRAINING_OPTS, a.training)}`);
         if (a.ratings?.length) lines.push(`⭐ הגדרים: ${a.ratings.map(c => sheetValue(RATING_OPTS, c)).join(', ')}`);
         if (a.extra) lines.push(`📝 ${escapeHTML(a.extra)}`);
@@ -314,18 +341,24 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID }
         return lines.join('\n');
     }
 
+    /** The default approve/reject card keyboard - also used to restore the card after "🔙 ביטול" on the group picker. */
+    function pendingCardKeyboard(telegramId) {
+        return {
+            inline_keyboard: [[
+                { text: '✅ אישור', callback_data: `aq:app:${telegramId}` },
+                { text: '⛔ דחייה', callback_data: `aq:rej:${telegramId}` },
+            ], [
+                { text: '📋 השלמה ידנית', callback_data: `aq:fill:${telegramId}` },
+                { text: '🔀 בחירת קבוצות', callback_data: `aq:groups:${telegramId}` },
+            ]],
+        };
+    }
+
     async function sendAdminCard(telegramId) {
         const applicant = await getApplicant(telegramId);
         await telegram.sendMessage(FEEDBACK_CHANNEL_ID, summaryText(applicant), {
             parse_mode: 'HTML',
-            reply_markup: {
-                inline_keyboard: [[
-                    { text: '✅ אישור', callback_data: `aq:app:${telegramId}` },
-                    { text: '⛔ דחייה', callback_data: `aq:rej:${telegramId}` },
-                ], [
-                    { text: '📋 השלמה ידנית', callback_data: `aq:fill:${telegramId}` },
-                ]],
-            },
+            reply_markup: pendingCardKeyboard(telegramId),
         });
     }
 
@@ -402,6 +435,9 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID }
                 return advance(chatId, target, fillOpts);
             case 'cat':
                 target = await saveAnswers(target, { category: opt });
+                if (isCommercialMismatch(target.answers?.requested_group_key, opt)) {
+                    await telegram.sendMessage(chatId, GROUP_MISMATCH_NUDGE_INTERVIEW).catch(() => {});
+                }
                 return advance(chatId, target, fillOpts);
             case 'lic':
                 target = await saveAnswers(target, { license: opt, ...(opt === 'none' ? { auth_done: true } : {}) });
@@ -514,8 +550,15 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID }
         INTRO_MSG,
         getApplicant, upsertApplicant, nextQuestion, advance,
         handleCallback, handleText, handleContact,
-        buildSheetRow, sendAdminCard, summaryText,
+        buildSheetRow, sendAdminCard, summaryText, pendingCardKeyboard,
+        isCommercialMismatch, categoryLabel, GROUP_MISMATCH_NUDGE_EXTRA,
     };
 }
 
-module.exports = { createInterview, PHONE_SKIP_TEXT };
+module.exports = {
+    createInterview,
+    PHONE_SKIP_TEXT,
+    isCommercialMismatch,
+    categoryLabel,
+    GROUP_MISMATCH_NUDGE_EXTRA,
+};

@@ -69,6 +69,7 @@ const interview = createInterview({
   telegram: bot.telegram,
   escapeHTML,
   FEEDBACK_CHANNEL_ID,
+  GROUP_LINKS,
 });
 
 
@@ -217,6 +218,7 @@ function getAdminPanel() {
                 [{ text: '📊 Status', callback_data: 'admin_status' }],
                 [{ text: '📥 Fetch Legacy', callback_data: 'admin_fetch' }, { text: '🧹 Clean Legacy', callback_data: 'admin_clean' }],
                 [{ text: '🚫 Ban user', callback_data: 'admin_ban' }],
+                [{ text: '➕ הוספה לקבוצה', callback_data: 'admin_addgroup' }],
                 [{ text: '🔗 Post Links to Channel', callback_data: 'admin_links' }],
                 [{ text: '🔙 Back', callback_data: 'back_home' }]
             ]
@@ -255,11 +257,72 @@ async function showHomeMenu(ctx) {
 // =============================================================================
 
 /**
- * Writes the applicant to the BJA Members sheet (update if a row already
- * exists), admits them to the requested group, and notifies them.
- * Sheet failures never lose data: answers stay in Supabase and admins are told.
+ * Builds the group multi-select keyboard used both on a pending applicant's
+ * admin card (aq:groups / aq:gtoggle / aq:gconfirm / aq:gcancel) and on the
+ * standalone "add an existing member to a group" admin flow (aq:addsend /
+ * aq:addcancel). Selection state lives transiently in answers._admin_pick.
  */
-async function approveApplicant(applicant, adminId) {
+function groupToggleKeyboard(tidStr, selectedKeys, confirmVerb, cancelVerb) {
+    return {
+        inline_keyboard: [
+            ...GROUP_LINKS.map(g => [{
+                text: `${selectedKeys.includes(g.key) ? '✅' : '⬜'} ${g.text}`,
+                callback_data: `aq:gtoggle:${tidStr}:${g.key}`,
+            }]),
+            [
+                { text: '✅ אישור ושליחה', callback_data: `aq:${confirmVerb}:${tidStr}` },
+                { text: '🔙 ביטול', callback_data: `aq:${cancelVerb}:${tidStr}` },
+            ],
+        ],
+    };
+}
+
+/**
+ * Posts a lightweight review card when an already-known applicant (approved
+ * member, or retro_pending with a complete profile) requests a group that
+ * doesn't match their stated flying category - holds the real invite link
+ * until an admin explicitly sends it, instead of handing it out instantly.
+ */
+async function notifyAdminGroupMismatch(applicant, key) {
+    const group = GROUP_LINKS.find(g => g.key === key);
+    const a = applicant.answers || {};
+    const text =
+        `🔁 <b>בקשה לקבוצה נוספת - דורשת בדיקה</b>\n\n` +
+        `👤 ${escapeHTML(a.name || applicant.tg_first_name || '')} (@${escapeHTML(applicant.username || 'אין')})\n` +
+        `🆔 ${applicant.telegram_id}\n` +
+        `💬 <a href="tg://user?id=${applicant.telegram_id}">פנייה ישירה למועמד</a>\n` +
+        `✈️ סטטוס קיים: ${interview.categoryLabel(a.category)}\n` +
+        `🎯 מבקש/ת להצטרף ל: ${group ? group.text : key}`;
+    await bot.telegram.sendMessage(FEEDBACK_CHANNEL_ID, text, {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [[
+                { text: '✅ שלח קישור', callback_data: `aq:extra_send:${applicant.telegram_id}:${key}` },
+                { text: '⛔ לא כרגע', callback_data: `aq:extra_deny:${applicant.telegram_id}:${key}` },
+            ]],
+        },
+    }).catch(() => {});
+}
+
+/** Looks up an approved member by Telegram ID or @username, for the standalone "add to group" admin flow. */
+async function resolveApprovedApplicant(input) {
+    const trimmed = input.trim();
+    let query = supabase.from('applicants').select('*').eq('status', 'approved');
+    query = /^\d+$/.test(trimmed)
+        ? query.eq('telegram_id', parseInt(trimmed))
+        : query.ilike('username', trimmed.replace(/^@/, ''));
+    const { data } = await query.maybeSingle();
+    return data || null;
+}
+
+/**
+ * Writes the applicant to the BJA Members sheet (update if a row already
+ * exists), admits them to the requested group(s), and notifies them.
+ * Sheet failures never lose data: answers stay in Supabase and admins are told.
+ * `overrideGroupKeys`, when given (from the admin card's group picker), sends
+ * invite links for that exact set of groups instead of just the one requested.
+ */
+async function approveApplicant(applicant, adminId, overrideGroupKeys) {
     const tid = applicant.telegram_id;
     let sheetNote = '';
 
@@ -297,25 +360,44 @@ async function approveApplicant(applicant, adminId) {
     // If there was a real pending Telegram join request, approveChatJoinRequest above
     // already admitted them and no link is needed. Otherwise (the bot-first flow -
     // startJoinFlow) they were never actually issued a Telegram join request, so send
-    // the real invite link for the specific group they asked for.
+    // the real invite link(s) for whichever group(s) they end up with. `overrideGroupKeys`
+    // (set via the admin card's "🔀 בחירת קבוצות" picker) wins over the single requested one.
     const groupKey = applicant.answers?.requested_group_key;
-    const group = groupKey ? GROUP_LINKS.find(g => g.key === groupKey) : null;
+    const keysToSend = (overrideGroupKeys && overrideGroupKeys.length) ? overrideGroupKeys : (groupKey ? [groupKey] : []);
+    const groupsToSend = keysToSend.map(k => GROUP_LINKS.find(g => g.key === k)).filter(Boolean);
 
-    if (admittedDirectly || !group) {
+    if (admittedDirectly && !(overrideGroupKeys && overrideGroupKeys.length)) {
         await bot.telegram.sendMessage(tid,
             '🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️'
         ).catch(() => {});
+    } else if (groupsToSend.length) {
+        const joinLine = groupsToSend.length === 1
+            ? `לחץ כדי להצטרף ל-${groupsToSend[0].text}:`
+            : 'לחץ כדי להצטרף לקבוצות:';
+        await bot.telegram.sendMessage(tid,
+            `🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\n${joinLine}`,
+            { reply_markup: { inline_keyboard: groupsToSend.map(g => [{ text: g.text, url: g.url }]) } }
+        ).catch(() => {});
     } else {
         await bot.telegram.sendMessage(tid,
-            `🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nלחץ כדי להצטרף ל-${group.text}:`,
-            { reply_markup: { inline_keyboard: [[{ text: group.text, url: group.url }]] } }
+            '🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️'
         ).catch(() => {});
     }
 
     return sheetNote;
 }
 
-async function rejectApplicant(applicant, adminId) {
+/**
+ * `reason`, when given, is shown to the applicant and comes from the admin
+ * typing it in response to the "⛔ דחייה" prompt (aq:rej -> rejreason:<tid>
+ * mode); null/undefined means the admin chose "⏭️ דחייה ללא סיבה".
+ * After rejecting, the applicant is put into a listening mode (chat_mode
+ * 'rejected_appeal') so a reply they type isn't silently swallowed by the
+ * generic menu fallback - it gets relayed to admins and can go back and
+ * forth via the bot itself, which (unlike a tg://user?id= link) always
+ * works once someone has messaged the bot, regardless of their privacy settings.
+ */
+async function rejectApplicant(applicant, adminId, reason) {
     await interview.upsertApplicant({
         telegram_id: applicant.telegram_id,
         status: 'rejected',
@@ -327,10 +409,22 @@ async function rejectApplicant(applicant, adminId) {
         await bot.telegram.declineChatJoinRequest(applicant.chat_requested, applicant.telegram_id).catch(() => {});
     }
 
+    const reasonLine = reason ? `\n\n📝 סיבה: ${escapeHTML(reason)}` : '';
     await bot.telegram.sendMessage(applicant.telegram_id,
-        '🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה. לבירור או ערעור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
+        `🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה.${reasonLine}\n\n` +
+        `אם תרצה/י להגיב או לשאול שאלה, אפשר פשוט להשיב כאן בצ'אט ונציג מהצוות יחזור אליך. אפשר גם לפנות ישירות - <a href="tg://user?id=382965373">לחצו כאן</a>.`,
         { parse_mode: 'HTML' }
     ).catch(() => {});
+
+    // Upsert (not setUserMode's plain update) so this works even for a legacy
+    // chat_join_request applicant who may have no `users` row yet. Only include
+    // username/first_name when we actually have a value, so a missing one here
+    // doesn't null out something already on file for this user.
+    const userPatch = { user_id: applicant.telegram_id, chat_mode: 'rejected_appeal' };
+    if (applicant.username) userPatch.username = applicant.username;
+    const nameVal = applicant.answers?.name || applicant.tg_first_name;
+    if (nameVal) userPatch.first_name = nameVal;
+    await supabase.from('users').upsert([userPatch], { onConflict: 'user_id' });
 }
 
 /**
@@ -361,22 +455,34 @@ async function startJoinFlow(ctx, key) {
         );
     }
 
-    // Already an approved member (e.g. joining another BJA group): straight to the real link
+    // Already an approved member (e.g. joining another BJA group): straight to the real
+    // link - unless their on-file profile doesn't match this group, in which case hold it
+    // for a manual check instead of handing it out automatically.
     if (applicant?.status === 'approved') {
+        if (interview.isCommercialMismatch(key, applicant.answers?.category)) {
+            await notifyAdminGroupMismatch(applicant, key);
+            return ctx.reply(interview.GROUP_MISMATCH_NUDGE_EXTRA);
+        }
         return ctx.reply(
             `🔵 אתה כבר חבר מאושר בקהילה! לחץ כדי להצטרף ל-${group.text}:`,
             { reply_markup: { inline_keyboard: [[{ text: group.text, url: group.url }]] } }
         );
     }
 
-    // Retro-approved: admit once any missing questions are completed
+    // Retro-approved: admit once any missing questions are completed (same mismatch hold
+    // applies here, since this path also auto-approves without going through the admin queue)
     if (applicant?.status === 'retro_pending') {
         applicant = await interview.upsertApplicant({
             telegram_id: userId,
             answers: { ...(applicant.answers || {}), requested_group_key: key },
         });
         if (interview.nextQuestion(applicant) === null) {
-            await approveApplicant(applicant, null);
+            if (interview.isCommercialMismatch(key, applicant.answers?.category)) {
+                await notifyAdminGroupMismatch(applicant, key);
+                await ctx.reply(interview.GROUP_MISMATCH_NUDGE_EXTRA);
+            } else {
+                await approveApplicant(applicant, null);
+            }
         } else {
             await ctx.reply('🔵 כמעט שם! נשארו כמה פרטים קצרים להשלמה:');
             await interview.advance(userId, applicant);
@@ -538,7 +644,7 @@ bot.on('callback_query', async (ctx) => {
     // --- Admin decisions on applicants ---
     if (action.startsWith('aq:')) {
         if (!isAdmin) return ctx.reply('❌ Unauthorized.');
-        const [, verb, tidStr] = action.split(':');
+        const [, verb, tidStr, extraArg] = action.split(':');
         const applicant = await interview.getApplicant(parseInt(tidStr));
         if (!applicant) return ctx.reply('⚠️ מועמד לא נמצא.');
 
@@ -551,14 +657,33 @@ bot.on('callback_query', async (ctx) => {
             }
             if (verb === 'rej') {
                 if (applicant.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
-                await rejectApplicant(applicant, userId);
+                await setUserMode(userId, `rejreason:${tidStr}`);
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                return ctx.reply('✍️ כתוב/כתבי את הסיבה לדחייה (תישלח למועמד):', {
+                    reply_markup: { inline_keyboard: [[{ text: '⏭️ דחייה ללא סיבה', callback_data: `aq:rejskip:${tidStr}` }]] },
+                });
+            }
+            if (verb === 'rejskip') {
+                if (applicant.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
+                await rejectApplicant(applicant, userId, null);
                 await ctx.editMessageReplyMarkup({
                     inline_keyboard: [[
                         { text: '↩️ אשר בדיעבד', callback_data: `aq:retro:${tidStr}` },
                         { text: '📋 השלמה ידנית', callback_data: `aq:fill:${tidStr}` },
                     ]],
                 }).catch(() => {});
-                return ctx.reply(`⛔ ${applicant.answers?.name || tidStr} סורב. ניתן לאשר בדיעבד מהכרטיס.`);
+                return ctx.reply(`⛔ ${applicant.answers?.name || tidStr} סורב (ללא סיבה). ניתן לאשר בדיעבד מהכרטיס.`);
+            }
+            if (verb === 'replyto') {
+                await setUserMode(userId, `admin_reply:${tidStr}`);
+                return ctx.reply('✍️ כתוב/כתבי את התשובה שתישלח למועמד:');
+            }
+            if (verb === 'closeappeal') {
+                await supabase.from('users').update({ chat_mode: null }).eq('user_id', applicant.telegram_id);
+                await ctx.editMessageReplyMarkup({
+                    inline_keyboard: [[{ text: '↩️ השב למועמד', callback_data: `aq:replyto:${tidStr}` }]],
+                }).catch(() => {});
+                return ctx.reply('✅ הערעור סומן כסגור. הודעות נוספות מהמועמד לא יועברו אוטומטית יותר (אפשר עדיין להשיב ידנית).');
             }
             if (verb === 'retro') {
                 await interview.upsertApplicant({ telegram_id: applicant.telegram_id, status: 'retro_pending' });
@@ -575,6 +700,84 @@ bot.on('callback_query', async (ctx) => {
                 await ctx.telegram.sendMessage(userId, `📋 השלמה ידנית עבור ${applicant.answers?.name || applicant.tg_first_name || tidStr}.\nלביטול בכל שלב: /cancel`).catch(() => {});
                 await interview.advance(userId, applicant, { fillMode: true, adminId: userId });
                 return ctx.reply('📋 נשלחו אליך השאלות החסרות בצ\'אט הפרטי עם הבוט.');
+            }
+
+            // --- Manual group picker on the pending-applicant card ---
+            if (verb === 'groups') {
+                const initial = applicant.answers?.requested_group_key ? [applicant.answers.requested_group_key] : [];
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: { ...applicant.answers, _admin_pick: initial } });
+                await ctx.editMessageReplyMarkup(groupToggleKeyboard(tidStr, initial, 'gconfirm', 'gcancel')).catch(() => {});
+                return;
+            }
+            if (verb === 'gtoggle') {
+                // Shared toggle handler for both the pending-applicant picker (gconfirm/gcancel)
+                // and the standalone "add existing member" picker (addsend/addcancel) - inferred
+                // from whether this applicant is already approved, so each flow keeps its own confirm verb.
+                const [confirmVerb, cancelVerb] = applicant.status === 'approved' ? ['addsend', 'addcancel'] : ['gconfirm', 'gcancel'];
+                const picks = new Set(applicant.answers?._admin_pick || []);
+                picks.has(extraArg) ? picks.delete(extraArg) : picks.add(extraArg);
+                const updated = [...picks];
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: { ...applicant.answers, _admin_pick: updated } });
+                await ctx.editMessageReplyMarkup(groupToggleKeyboard(tidStr, updated, confirmVerb, cancelVerb)).catch(() => {});
+                return;
+            }
+            if (verb === 'gconfirm') {
+                const picks = (applicant.answers?._admin_pick?.length ? applicant.answers._admin_pick
+                    : (applicant.answers?.requested_group_key ? [applicant.answers.requested_group_key] : []));
+                if (applicant.status === 'approved') return ctx.reply('ℹ️ כבר אושר.');
+                const cleanAnswers = { ...applicant.answers };
+                delete cleanAnswers._admin_pick;
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: cleanAnswers });
+                const note = await approveApplicant({ ...applicant, answers: cleanAnswers }, userId, picks);
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                return ctx.reply(`✅ ${applicant.answers?.name || tidStr} אושר ונוסף לגיליון.${note}`);
+            }
+            if (verb === 'gcancel') {
+                const cleanAnswers = { ...applicant.answers };
+                delete cleanAnswers._admin_pick;
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: cleanAnswers });
+                await ctx.editMessageReplyMarkup(interview.pendingCardKeyboard(tidStr)).catch(() => {});
+                return;
+            }
+
+            // --- Mismatch review card: already-known member requesting a group that doesn't fit ---
+            if (verb === 'extra_send') {
+                const group = GROUP_LINKS.find(g => g.key === extraArg);
+                if (!group) return ctx.reply('⚠️ קבוצה לא נמצאה.');
+                await ctx.telegram.sendMessage(applicant.telegram_id,
+                    `🔵 מצוות Blue Jay Aviation: הבקשה שלך אושרה, לחץ כדי להצטרף ל-${group.text}:`,
+                    { reply_markup: { inline_keyboard: [[{ text: group.text, url: group.url }]] } }
+                ).catch(() => {});
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                return ctx.reply('✅ הקישור נשלח.');
+            }
+            if (verb === 'extra_deny') {
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                return ctx.reply('⛔ סומן כ"לא כרגע". אפשר לפנות למועמד ישירות מהכרטיס אם צריך.');
+            }
+
+            // --- Standalone "add existing member to group(s)" flow ---
+            if (verb === 'addsend') {
+                const picks = applicant.answers?._admin_pick || [];
+                const groups = picks.map(k => GROUP_LINKS.find(g => g.key === k)).filter(Boolean);
+                if (!groups.length) return ctx.reply('⚠️ לא נבחרו קבוצות.');
+                const joinLine = groups.length === 1 ? `לחץ כדי להצטרף ל-${groups[0].text}:` : 'לחץ כדי להצטרף לקבוצות:';
+                await ctx.telegram.sendMessage(applicant.telegram_id,
+                    `🔵 מצוות Blue Jay Aviation: ${joinLine}`,
+                    { reply_markup: { inline_keyboard: groups.map(g => [{ text: g.text, url: g.url }]) } }
+                ).catch(() => {});
+                const cleanAnswers = { ...applicant.answers };
+                delete cleanAnswers._admin_pick;
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: cleanAnswers });
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                return ctx.reply('✅ הקישור/ים נשלחו.');
+            }
+            if (verb === 'addcancel') {
+                const cleanAnswers = { ...applicant.answers };
+                delete cleanAnswers._admin_pick;
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: cleanAnswers });
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                return;
             }
         } catch (e) {
             console.error('admin queue action error:', e);
@@ -709,6 +912,9 @@ bot.on('callback_query', async (ctx) => {
         case 'admin_ban':
             await setUserMode(userId, 'ban_waiting');
             return ctx.reply('🚫 Enter user ID to ban:');
+        case 'admin_addgroup':
+            await setUserMode(userId, 'addgroup_waiting');
+            return ctx.reply('✍️ שלח/י Telegram ID או @username של החבר להוספה לקבוצה:');
         case 'admin_links':
             const linkText = `🔵 ברוכים הבאים לערוץ <b>Blue Jay Aviation</b>!\n\n📌 <b>הקבוצות שלנו</b> - לחצו על הקבוצה שמעניינת אתכם כדי להתחיל תהליך הצטרפות קצר דרך הבוט:\n\nטיסות בטוחות! ✈️`;
             await ctx.telegram.sendMessage(parseInt(CHANNEL_ID), linkText, {
@@ -762,6 +968,43 @@ bot.on(message('text'), async (ctx) => {
             const consumed = await interview.handleText(ctx, target, text, { fillMode: true, adminId: userId });
             if (consumed) return;
         }
+    }
+
+    // --- Flow: Admin typing a rejection reason (aq:rej prompt) ---
+    if (ADMINS.includes(userId) && mode?.startsWith('rejreason:')) {
+        if (text === '/cancel') {
+            await setUserMode(userId, null);
+            return ctx.reply('בוטל. ✔️');
+        }
+        const targetTid = parseInt(mode.slice('rejreason:'.length));
+        const target = await interview.getApplicant(targetTid);
+        await setUserMode(userId, null);
+        if (!target) return ctx.reply('⚠️ מועמד לא נמצא.');
+        if (target.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
+        await rejectApplicant(target, userId, text);
+        return ctx.reply(`⛔ ${target.answers?.name || targetTid} סורב עם הסיבה שצוינה.`, {
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '↩️ אשר בדיעבד', callback_data: `aq:retro:${targetTid}` },
+                    { text: '📋 השלמה ידנית', callback_data: `aq:fill:${targetTid}` },
+                ]],
+            },
+        });
+    }
+
+    // --- Flow: Admin typing a reply to a rejected applicant's appeal ---
+    if (ADMINS.includes(userId) && mode?.startsWith('admin_reply:')) {
+        if (text === '/cancel') {
+            await setUserMode(userId, null);
+            return ctx.reply('בוטל. ✔️');
+        }
+        const targetTid = parseInt(mode.slice('admin_reply:'.length));
+        await setUserMode(userId, null);
+        await ctx.telegram.sendMessage(targetTid,
+            `💬 תגובה מצוות Blue Jay Aviation:\n\n${escapeHTML(text)}`,
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+        return ctx.reply('✅ נשלח למועמד.');
     }
 
     // --- Flow: Join interview (free-text answers) ---
@@ -845,6 +1088,29 @@ bot.on(message('text'), async (ctx) => {
         return ctx.reply('✅ Thanks! Your info was sent to the team and will be updated in our records.');
     }
 
+    // --- Flow: Reply from a rejected applicant (set by rejectApplicant) - stays open for
+    // ongoing back-and-forth until an admin taps "✅ סגור ערעור" on a review card. ---
+    if (mode === 'rejected_appeal') {
+        const target = await interview.getApplicant(userId);
+        const dateStr = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jerusalem' });
+        const report =
+            `🔁 <b>תגובה לדחייה</b>\n\n` +
+            `👤 ${escapeHTML(target?.answers?.name || ctx.from.first_name)} (@${escapeHTML(username || 'אין')})\n` +
+            `🆔 ${userId}\n` +
+            `💬 <a href="tg://user?id=${userId}">פנייה ישירה</a>\n` +
+            `🕒 ${dateStr}\n\n${escapeHTML(text)}`;
+        await ctx.telegram.sendMessage(FEEDBACK_CHANNEL_ID, report, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '↩️ השב למועמד', callback_data: `aq:replyto:${userId}` },
+                    { text: '✅ סגור ערעור', callback_data: `aq:closeappeal:${userId}` },
+                ]],
+            },
+        });
+        return ctx.reply('✅ ההודעה נשלחה לצוות, ניצור איתך קשר בהקדם.');
+    }
+
     // --- Flow: Admin Ban Action ---
     if (mode === 'ban_waiting' && ADMINS.includes(userId)) {
         const targetId = parseInt(text);
@@ -852,6 +1118,18 @@ bot.on(message('text'), async (ctx) => {
         await supabase.from('blacklist').upsert([{ user_id: targetId }]);
         await setUserMode(userId, null);
         return ctx.reply(`✅ User ${targetId} banned.`);
+    }
+
+    // --- Flow: Admin "add existing member to group(s)" - standalone, any time, not tied to the approval queue ---
+    if (mode === 'addgroup_waiting' && ADMINS.includes(userId)) {
+        await setUserMode(userId, null);
+        const target = await resolveApprovedApplicant(text);
+        if (!target) return ctx.reply('⚠️ לא נמצא חבר מאושר עם המזהה הזה.');
+        await interview.upsertApplicant({ telegram_id: target.telegram_id, answers: { ...target.answers, _admin_pick: [] } });
+        return ctx.reply(
+            `🔀 בחירת קבוצות עבור ${target.answers?.name || target.tg_first_name || target.telegram_id}:`,
+            { reply_markup: groupToggleKeyboard(String(target.telegram_id), [], 'addsend', 'addcancel') }
+        );
     }
 
     // Default: Show Menu
