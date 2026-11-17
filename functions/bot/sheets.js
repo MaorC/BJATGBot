@@ -15,33 +15,29 @@
  * In Training For | License Authority | Ratings | Flying Category | Employer |
  * Aircraft | Platform Source | Join Date | Notes | Needs Review | Telegram ID
  *
- * One person = one row. Before anything is written, saveMember() looks for an
- * existing row for the same person (Telegram ID, then phone, then full name)
- * and updates that row instead of adding a second one. Updates only touch the
- * cells that actually changed, so manually maintained columns (Employer,
- * Aircraft, Join Date, the member's ID / seniority) are never overwritten.
+ * One person = one row. The rules for "is this the same person" and "how are
+ * two rows combined" live in matching.js; this file only reads and writes.
+ *
+ * A second tab, "Merge Log", is created on first use. Every merge copies the
+ * removed row there in full (so nothing is ever lost), and every "these are
+ * different people" decision is recorded there so the bot doesn't ask again.
  */
 
 const { JWT } = require('google-auth-library');
+const M = require('./matching');
+
+const { COL, WIDTH, pad, str, safeCell, phoneCell, phoneUsable, phonesMatch, compareNames, appendParts } = M;
 
 const SHEET_ID = process.env.SHEET_ID;
 const SHEET_TAB = process.env.SHEET_TAB || 'Members';
+const LOG_TAB = 'Merge Log';
 const BASE = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}`;
-
-// Column indexes (0-based) in the Members tab
-const COL = {
-    ID: 0, FIRST: 1, LAST: 2, PHONE: 3, STATUS: 4, RESIDENCY: 5, LICENSE: 6,
-    TRAINING: 7, AUTHORITY: 8, RATINGS: 9, CATEGORY: 10, EMPLOYER: 11,
-    AIRCRAFT: 12, PLATFORM: 13, JOIN_DATE: 14, NOTES: 15, REVIEW: 16, TG_ID: 17,
-};
-const WIDTH = 18;
 const LAST_COL = 'R';
 const TG_ID_HEADER = 'Telegram ID';
-const FIELD_LABELS = {
-    [COL.PHONE]: 'Phone', [COL.STATUS]: 'Status', [COL.RESIDENCY]: 'Residency',
-    [COL.LICENSE]: 'License Level', [COL.TRAINING]: 'In Training For',
-    [COL.CATEGORY]: 'Flying Category',
-};
+const LOG_HEADER = ['Date', 'Action', 'Kept ID', 'Other ID', 'By', 'Details',
+    'ID', 'First Name', 'Last Name', 'Phone', 'Status', 'Residency', 'License Level', 'In Training For',
+    'License Authority', 'Ratings', 'Flying Category', 'Employer', 'Aircraft', 'Platform Source',
+    'Join Date', 'Notes', 'Needs Review', 'Telegram ID'];
 
 let jwtClient = null;
 
@@ -67,227 +63,12 @@ function getClient() {
     return jwtClient;
 }
 
-const tabRange = (a1) => `${encodeURIComponent(SHEET_TAB)}!${a1}`;
+const quoteTab = (t) => `'${t.replace(/'/g, "''")}'`;
+const tabRange = (a1, tab = SHEET_TAB) => `${encodeURIComponent(quoteTab(tab))}!${a1}`;
 const colLetter = (i) => String.fromCharCode(65 + i);
+const todayIL = () => new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Jerusalem' });
 
-// ---------- Pure helpers (no network) ----------
-
-/**
- * Digits-only phone for comparison, without leading zeros. Numbers reach the
- * sheet in many shapes (+972541234567, 054-1234567, or 541234567 when Sheets
- * stored a typed number and dropped its zero), so two phones are treated as
- * the same when one ends with the other and at least 9 digits agree.
- */
-function normalizePhone(raw) {
-    return String(raw === undefined || raw === null ? '' : raw).replace(/\D/g, '').replace(/^0+/, '');
-}
-
-function phonesMatch(a, b) {
-    const x = normalizePhone(a);
-    const y = normalizePhone(b);
-    if (x.length < 9 || y.length < 9) return false;   // truncated / junk numbers never match
-    return x.length >= y.length ? x.endsWith(y) : y.endsWith(x);
-}
-
-/**
- * Phone as it is written to the sheet: an Israeli mobile typed locally
- * (05X-XXXXXXX) is stored in the same +972 form as the rest of the sheet, and
- * every phone is forced to plain text so Sheets can't strip a "+" or a zero.
- */
-function phoneCell(raw) {
-    let v = String(raw === undefined || raw === null ? '' : raw).trim();
-    if (!v) return '';
-    const digits = v.replace(/\D/g, '');
-    if (/^05\d{8}$/.test(digits)) v = `+972${digits.slice(1)}`;
-    return `'${v}`;
-}
-
-const normName = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
-const fullName = (row) => normName(`${row[COL.FIRST] || ''} ${row[COL.LAST] || ''}`);
-
-/**
- * Values are written with USER_ENTERED so IDs and dates keep working in the
- * Dashboard formulas. That also means text typed by an applicant could be
- * read by Sheets as a formula ("=...") or a number ("+972..." loses its plus).
- * A leading apostrophe forces Sheets to store the value as plain text.
- */
-function safeCell(v) {
-    const s = String(v === undefined || v === null ? '' : v);
-    return /^[=+\-@]/.test(s) ? `'${s}` : s;
-}
-
-const splitList = (s) => String(s || '').split(',').map(x => x.trim()).filter(Boolean);
-function unionList(oldVal, newVal) {
-    const out = splitList(oldVal);
-    for (const item of splitList(newVal)) {
-        if (!out.some(o => o.toLowerCase() === item.toLowerCase())) out.push(item);
-    }
-    return out.join(', ');
-}
-function appendParts(oldVal, newVal) {
-    const out = String(oldVal || '').split(';').map(x => x.trim()).filter(Boolean);
-    for (const part of String(newVal || '').split(';').map(x => x.trim()).filter(Boolean)) {
-        if (!out.includes(part)) out.push(part);
-    }
-    return out.join('; ');
-}
-
-function pad(row) {
-    const r = (row || []).map(v => (v === undefined || v === null ? '' : String(v)));
-    while (r.length < WIDTH) r.push('');
-    return r;
-}
-
-/**
- * Finds the existing row for a person, strongest evidence first:
- *   1. Telegram ID (column R)            - strong
- *   2. phone number                      - strong (weak if the row belongs to another Telegram account)
- *   3. identical full name (2+ words)    - weak, an admin has to confirm
- * @param {Array<{rowNumber:number, values:string[]}>} rows
- * @returns {null|{strength:'strong'|'weak', by:'telegram'|'phone'|'name', rowNumber, memberId, name}}
- */
-function findMatch(rows, { telegramId, phone, name } = {}) {
-    const describe = (r, by, strength) => ({
-        strength, by, rowNumber: r.rowNumber,
-        memberId: r.values[COL.ID] || '',
-        name: `${r.values[COL.FIRST] || ''} ${r.values[COL.LAST] || ''}`.trim(),
-    });
-
-    if (telegramId) {
-        const hit = rows.find(r => String(r.values[COL.TG_ID] || '').trim() === String(telegramId));
-        if (hit) return describe(hit, 'telegram', 'strong');
-    }
-    if (phone) {
-        const hit = rows.find(r => phonesMatch(r.values[COL.PHONE], phone));
-        if (hit) {
-            // Same phone, but the row already belongs to a different Telegram account:
-            // could be the same person on a new account or two people sharing a number,
-            // so an admin decides instead of the bot.
-            const owner = String(hit.values[COL.TG_ID] || '').trim();
-            const conflict = owner && telegramId && owner !== String(telegramId);
-            return describe(hit, 'phone', conflict ? 'weak' : 'strong');
-        }
-    }
-    const wanted = normName(name);
-    if (wanted && wanted.includes(' ')) {
-        const hit = rows.find(r => fullName(r.values) === wanted);
-        if (hit) return describe(hit, 'name', 'weak');
-    }
-    return null;
-}
-
-/**
- * Works out which cells of an existing member row should change when the same
- * person comes through the bot again (for example later in their career).
- * Rules: the ID / seniority, name, Employer, Aircraft and Join Date are kept;
- * career fields take the newest non-empty answer; authorities and ratings are
- * added to, never removed; every replaced value is logged in Notes.
- * @returns {{changes: Object<number,string>, replaced: string[]}}
- */
-function mergeRow(existingRow, incomingRow, today) {
-    const old = pad(existingRow);
-    const inc = pad(incomingRow);
-    const changes = {};
-    const replaced = [];
-    const same = (a, b) => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
-
-    // Name: only fill a blank, never rewrite how a member is listed
-    for (const c of [COL.FIRST, COL.LAST]) {
-        if (!old[c].trim() && inc[c].trim()) changes[c] = inc[c];
-    }
-
-    if (inc[COL.PHONE].trim() && !phonesMatch(old[COL.PHONE], inc[COL.PHONE])
-        && normalizePhone(old[COL.PHONE]) !== normalizePhone(inc[COL.PHONE])) {
-        // (a number that is merely formatted differently is left exactly as it is)
-        changes[COL.PHONE] = inc[COL.PHONE];
-        if (old[COL.PHONE].trim()) replaced.push(`${FIELD_LABELS[COL.PHONE]}: ${old[COL.PHONE].trim()}`);
-    }
-
-    for (const c of [COL.STATUS, COL.RESIDENCY, COL.LICENSE, COL.TRAINING, COL.CATEGORY]) {
-        const v = inc[c].trim();
-        if (!v) continue;
-        if (c === COL.CATEGORY && v === 'Unknown') continue;   // "other" answer: keep what we knew
-        if (same(old[c], v)) continue;
-        changes[c] = v;
-        if (old[c].trim() && old[c].trim() !== 'Unknown') replaced.push(`${FIELD_LABELS[c]}: ${old[c].trim()}`);
-    }
-
-    for (const c of [COL.AUTHORITY, COL.RATINGS]) {
-        const merged = unionList(old[c], inc[c]);
-        if (merged !== splitList(old[c]).join(', ')) changes[c] = merged;
-    }
-
-    // A training goal that has since been reached (it now appears as the license
-    // level or among the ratings) is no longer "in training for".
-    const goal = old[COL.TRAINING].trim();
-    if (goal && !(COL.TRAINING in changes)) {
-        const license = (COL.LICENSE in changes ? changes[COL.LICENSE] : old[COL.LICENSE]).trim();
-        const ratings = splitList(COL.RATINGS in changes ? changes[COL.RATINGS] : old[COL.RATINGS]);
-        if ([license, ...ratings].some(v => same(v, goal))) {
-            changes[COL.TRAINING] = '';
-            replaced.push(`${FIELD_LABELS[COL.TRAINING]}: ${goal}`);
-        }
-    }
-
-    const platform = old[COL.PLATFORM].trim();
-    if (!platform || platform === 'Unknown') changes[COL.PLATFORM] = 'Telegram';
-    else if (platform === 'WhatsApp') changes[COL.PLATFORM] = 'Both';
-
-    let notes = appendParts(old[COL.NOTES], inc[COL.NOTES]);
-    // The listed name is never rewritten, so keep the spelling the member used with the bot
-    const listed = normName(`${old[COL.FIRST]} ${old[COL.LAST]}`);
-    const given = `${inc[COL.FIRST]} ${inc[COL.LAST]}`.trim();
-    if (given && listed && normName(given) !== listed) notes = appendParts(notes, `Name in bot: ${given}`);
-    if (replaced.length) notes = appendParts(notes, `Updated via bot ${today} (was ${replaced.join(', ')})`);
-    if (notes !== String(old[COL.NOTES]).trim()) changes[COL.NOTES] = notes;
-
-    const review = appendParts(old[COL.REVIEW], inc[COL.REVIEW]);
-    if (review !== String(old[COL.REVIEW]).trim()) changes[COL.REVIEW] = review;
-
-    if (inc[COL.TG_ID].trim() && old[COL.TG_ID].trim() !== inc[COL.TG_ID].trim()) {
-        changes[COL.TG_ID] = inc[COL.TG_ID].trim();
-    }
-
-    return { changes, replaced };
-}
-
-/** Groups of rows that look like the same person (same Telegram ID, phone or full name). */
-function findDuplicateGroups(rows) {
-    const buckets = new Map();
-    const add = (key, reason, r) => {
-        if (!buckets.has(key)) buckets.set(key, { reason, rows: [] });
-        buckets.get(key).rows.push(r);
-    };
-    for (const r of rows) {
-        const v = r.values;
-        if (!v[COL.ID] && !fullName(v)) continue;
-        const tg = String(v[COL.TG_ID] || '').trim();
-        const ph = normalizePhone(v[COL.PHONE]);
-        const nm = fullName(v);
-        if (tg) add(`tg:${tg}`, 'telegram', r);
-        if (ph.length >= 9) add(`ph:${ph.slice(-9)}`, 'phone', r);   // same rule as phonesMatch: last 9 digits agree
-        if (nm.includes(' ')) add(`nm:${nm}`, 'name', r);
-    }
-    const seen = new Set();
-    const groups = [];
-    for (const { reason, rows: members } of buckets.values()) {
-        if (members.length < 2) continue;
-        const sig = members.map(m => m.rowNumber).sort((a, b) => a - b).join(',');
-        if (seen.has(sig)) continue;      // same pair already reported for a stronger reason
-        seen.add(sig);
-        groups.push({
-            reason,
-            members: members.map(m => ({
-                rowNumber: m.rowNumber,
-                memberId: m.values[COL.ID] || '',
-                name: `${m.values[COL.FIRST] || ''} ${m.values[COL.LAST] || ''}`.trim(),
-            })),
-        });
-    }
-    return groups;
-}
-
-// ---------- Sheet access ----------
+// ---------- layout ----------
 
 /**
  * Column R ("Telegram ID") is new. The tab gets an 18th column once if it
@@ -299,22 +80,32 @@ function findDuplicateGroups(rows) {
 let gridReady = false;      // true once the 18th column is confirmed to exist
 let columnInUse = false;    // true if column R holds something that isn't ours
 let tgColumnState = false;  // whether column R is usable in the current read/write cycle
+let tabIds = null;          // { [title]: sheetId }
+
+async function loadTabs(force = false) {
+    if (tabIds && !force) return tabIds;
+    const meta = await getClient().request({
+        url: `${BASE}?fields=sheets(properties(sheetId,title,gridProperties(columnCount)))`,
+    });
+    tabIds = {};
+    let columns = 0;
+    for (const p of (meta.data.sheets || []).map(x => x.properties)) {
+        tabIds[p.title] = p.sheetId;
+        if (p.title === SHEET_TAB) columns = p.gridProperties?.columnCount || 0;
+    }
+    return Object.assign(tabIds, { _membersColumns: columns });
+}
 
 async function ensureGrid() {
     if (gridReady) return true;
-    const client = getClient();
     try {
-        const meta = await client.request({
-            url: `${BASE}?fields=sheets(properties(sheetId,title,gridProperties(columnCount)))`,
-        });
-        const sheet = (meta.data.sheets || []).map(x => x.properties).find(p => p.title === SHEET_TAB);
-        if (!sheet) throw new Error(`tab "${SHEET_TAB}" not found`);
-        const columns = sheet.gridProperties?.columnCount || 0;
-        if (columns < WIDTH) {
-            await client.request({
+        const tabs = await loadTabs(true);
+        if (tabs[SHEET_TAB] === undefined) throw new Error(`tab "${SHEET_TAB}" not found`);
+        if (tabs._membersColumns < WIDTH) {
+            await getClient().request({
                 url: `${BASE}:batchUpdate`,
                 method: 'POST',
-                data: { requests: [{ appendDimension: { sheetId: sheet.sheetId, dimension: 'COLUMNS', length: WIDTH - columns } }] },
+                data: { requests: [{ appendDimension: { sheetId: tabs[SHEET_TAB], dimension: 'COLUMNS', length: WIDTH - tabs._membersColumns } }] },
             });
         }
         gridReady = true;
@@ -335,8 +126,8 @@ async function readMembers() {
 
     tgColumnState = false;
     if (wide) {
-        const header = String(pad(all[0])[COL.TG_ID]).trim();
-        const columnHasData = all.slice(1).some(r => String((r || [])[COL.TG_ID] ?? '').trim());
+        const header = str(pad(all[0])[COL.TG_ID]);
+        const columnHasData = all.slice(1).some(r => str((r || [])[COL.TG_ID]));
         if (/telegram|\btg\b/i.test(header)) {
             tgColumnState = true;
         } else if (!header && !columnHasData && all.length) {
@@ -381,11 +172,11 @@ async function getNextMemberId() {
     return nextMemberId(await readMembers());
 }
 
+const TEXT_COLS = [COL.FIRST, COL.LAST, COL.NOTES, COL.REVIEW, COL.EMPLOYER, COL.AIRCRAFT];
+const cellFor = (c, v) => (c === COL.PHONE ? phoneCell(v) : TEXT_COLS.includes(c) ? safeCell(v) : String(v ?? ''));
+
 function prepareForWrite(values) {
-    const out = pad(values).slice(0, WIDTH);
-    for (const c of [COL.FIRST, COL.LAST, COL.NOTES, COL.REVIEW]) out[c] = safeCell(out[c]);
-    out[COL.PHONE] = phoneCell(out[COL.PHONE]);
-    return out;
+    return pad(values).slice(0, WIDTH).map((v, c) => (c === COL.ID ? v : cellFor(c, v)));
 }
 
 async function appendRow(values, rows) {
@@ -411,24 +202,25 @@ async function appendRow(values, rows) {
     return { memberId, rowNumber };
 }
 
-async function writeChanges(rowNumber, changes) {
-    const cols = Object.keys(changes).map(Number).filter(c => tgColumnState || c !== COL.TG_ID);
-    if (!cols.length) return;
-    const textCols = [COL.FIRST, COL.LAST, COL.NOTES, COL.REVIEW];
-    const cell = (c) => (c === COL.PHONE ? phoneCell(changes[c]) : textCols.includes(c) ? safeCell(changes[c]) : changes[c]);
-    const client = getClient();
-    await client.request({
+/** Writes only the given cells. `edits`: [{ rowNumber, changes: {col: value} }] */
+async function writeCells(edits) {
+    const data = [];
+    for (const { rowNumber, changes } of edits) {
+        for (const c of Object.keys(changes).map(Number)) {
+            if (c === COL.ID || (!tgColumnState && c === COL.TG_ID)) continue;
+            data.push({ range: `${quoteTab(SHEET_TAB)}!${colLetter(c)}${rowNumber}`, values: [[cellFor(c, changes[c])]] });
+        }
+    }
+    if (!data.length) return;
+    await getClient().request({
         url: `${BASE}/values:batchUpdate`,
         method: 'POST',
-        data: {
-            valueInputOption: 'USER_ENTERED',
-            data: cols.map(c => ({
-                range: `'${SHEET_TAB.replace(/'/g, "''")}'!${colLetter(c)}${rowNumber}`,
-                values: [[cell(c)]],
-            })),
-        },
+        data: { valueInputOption: 'USER_ENTERED', data },
     });
 }
+const writeChanges = (rowNumber, changes) => writeCells([{ rowNumber, changes }]);
+
+// ---------- saving an approved applicant ----------
 
 /**
  * The single way the bot writes a member: update the person's existing row if
@@ -440,7 +232,7 @@ async function writeChanges(rowNumber, changes) {
  * @param {number|string} [opts.knownMemberId]  member ID the bot already assigned to this Telegram user
  * @param {'auto'|'new'|'merge'} [opts.mode]
  *        auto  - update on a strong match (Telegram ID / phone), otherwise add a row
- *        merge - also update on a name-only match (admin confirmed it is the same person)
+ *        merge - also update on a weaker match (admin confirmed it is the same person)
  *        new   - always add a row (admin confirmed it is a different person)
  * @returns {{action:'created'|'updated', memberId, rowNumber, match, replaced:string[], weakMatch}}
  */
@@ -448,7 +240,7 @@ async function saveMember(values, { telegramId, knownMemberId, mode = 'auto' } =
     const rows = await readMembers();
     const incoming = pad(values);
     if (telegramId) incoming[COL.TG_ID] = String(telegramId);
-    const today = incoming[COL.JOIN_DATE];
+    const today = incoming[COL.JOIN_DATE] || todayIL();
 
     let target = null;
     let match = null;
@@ -456,23 +248,23 @@ async function saveMember(values, { telegramId, knownMemberId, mode = 'auto' } =
     // A member the bot already wrote: locate the row by its ID, not by a stored
     // row number, so sorting or deleting rows in the sheet can't misdirect the update.
     if (knownMemberId) {
-        const row = rows.find(r => String(r.values[COL.ID]).trim() === String(knownMemberId));
+        const row = rows.find(r => str(r.values[COL.ID]) === String(knownMemberId));
         // ...unless the sheet clearly says that ID now belongs to someone else (the row was
         // deleted and the number reused): then fall through to normal matching.
-        const owner = row ? String(row.values[COL.TG_ID] || '').trim() : '';
+        const owner = row ? str(row.values[COL.TG_ID]) : '';
         const otherAccount = owner && telegramId && owner !== String(telegramId);
-        const bothPhones = row && normalizePhone(row.values[COL.PHONE]).length >= 9 && normalizePhone(incoming[COL.PHONE]).length >= 9;
-        const otherPerson = !owner && bothPhones && !phonesMatch(row.values[COL.PHONE], incoming[COL.PHONE])
-            && fullName(row.values) !== normName(`${incoming[COL.FIRST]} ${incoming[COL.LAST]}`);
+        const bothPhones = row && phoneUsable(row.values[COL.PHONE]) && phoneUsable(incoming[COL.PHONE]);
+        const otherPerson = row && !owner && bothPhones && !phonesMatch(row.values[COL.PHONE], incoming[COL.PHONE])
+            && !compareNames(row.values, incoming);
         if (row && !otherAccount && !otherPerson) {
             target = row;
-            match = { strength: 'strong', by: 'member', rowNumber: row.rowNumber, memberId: row.values[COL.ID], name: `${row.values[COL.FIRST]} ${row.values[COL.LAST]}`.trim() };
+            match = { strength: 'strong', by: 'member', rowNumber: row.rowNumber, memberId: row.values[COL.ID], name: M.displayName(row.values) };
         }
     }
 
     let weakMatch = null;
     if (!target && mode !== 'new') {
-        const found = findMatch(rows, {
+        const found = M.findMatch(rows, {
             telegramId,
             phone: incoming[COL.PHONE],
             name: `${incoming[COL.FIRST]} ${incoming[COL.LAST]}`,
@@ -486,7 +278,7 @@ async function saveMember(values, { telegramId, knownMemberId, mode = 'auto' } =
     }
 
     if (target) {
-        const { changes, replaced } = mergeRow(target.values, incoming, today);
+        const { changes, replaced } = M.mergeRow(target.values, incoming, today);
         await writeChanges(target.rowNumber, changes);
         return {
             action: 'updated',
@@ -496,11 +288,10 @@ async function saveMember(values, { telegramId, knownMemberId, mode = 'auto' } =
         };
     }
 
-    // Looks like an existing member but the evidence is weak (same name only, or a
-    // phone that belongs to another Telegram account): add the row, and leave a
-    // visible flag so it shows up in the sheet's review workflow.
+    // Looks like an existing member but the evidence is weak: add the row, and
+    // leave a visible flag so it shows up in the sheet's review workflow.
     if (weakMatch) {
-        incoming[COL.REVIEW] = appendParts(incoming[COL.REVIEW], `possible duplicate of #${weakMatch.memberId} (same ${weakMatch.by})`);
+        incoming[COL.REVIEW] = appendParts(incoming[COL.REVIEW], `possible duplicate of #${weakMatch.memberId} (same ${weakMatch.by.replace('_', ' ')})`);
     }
     const { memberId, rowNumber } = await appendRow(incoming, rows);
     return { action: 'created', memberId, rowNumber, match: null, replaced: [], weakMatch };
@@ -508,17 +299,204 @@ async function saveMember(values, { telegramId, knownMemberId, mode = 'auto' } =
 
 /** Looks up (without writing) whether this person already has a row. */
 async function lookupMember({ telegramId, phone, name }) {
-    return findMatch(await readMembers(), { telegramId, phone, name });
+    return M.findMatch(await readMembers(), { telegramId, phone, name });
 }
 
-/** Scans the whole sheet for rows that look like the same person. Read-only. */
+// ---------- Merge Log tab ----------
+
+async function ensureLogTab() {
+    let tabs = await loadTabs();
+    if (tabs[LOG_TAB] !== undefined) return;
+    try {
+        await getClient().request({
+            url: `${BASE}:batchUpdate`,
+            method: 'POST',
+            data: { requests: [{ addSheet: { properties: { title: LOG_TAB } } }] },
+        });
+    } catch (e) {
+        if (!/already exists/i.test(e.message)) throw e;
+    }
+    tabs = await loadTabs(true);
+    await getClient().request({
+        url: `${BASE}/values/${tabRange('A1', LOG_TAB)}?valueInputOption=RAW`,
+        method: 'PUT',
+        data: { values: [LOG_HEADER] },
+    });
+}
+
+async function appendLog(entries) {
+    if (!entries.length) return;
+    await ensureLogTab();
+    await getClient().request({
+        url: `${BASE}/values/${tabRange('A:X', LOG_TAB)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+        method: 'POST',
+        data: { values: entries },
+    });
+}
+
+/** Pairs of member IDs an admin marked as different people ("id1-id2", sorted). */
+async function readDifferentPairs() {
+    const tabs = await loadTabs();
+    if (tabs[LOG_TAB] === undefined) return new Set();
+    const res = await getClient().request({ url: `${BASE}/values/${tabRange('A2:D', LOG_TAB)}` });
+    const out = new Set();
+    for (const r of res.data.values || []) {
+        if (str(r[1]) === 'different') out.add(M.pairKey(r[2], r[3]));
+    }
+    return out;
+}
+
+// ---------- duplicate clean-up ----------
+
+/** Suspected duplicate groups, minus pairs already marked as different people. Read-only. */
 async function scanDuplicates() {
-    return findDuplicateGroups(await readMembers());
+    const [rows, ignorePairs] = await Promise.all([readMembers(), readDifferentPairs()]);
+    return M.findDuplicateGroups(rows, { ignorePairs });
+}
+
+/**
+ * Re-reads the sheet and returns the group made of exactly these member IDs,
+ * or null if it no longer stands (a row was edited, deleted, or already merged).
+ */
+async function loadGroup(ids) {
+    const rows = await readMembers();
+    const members = ids.map(id => rows.find(r => str(r.values[COL.ID]) === String(id)));
+    if (members.some(m => !m)) return { rows, group: null };
+    const groups = M.findDuplicateGroups(members);
+    const group = groups.find(g => g.members.length === members.length) || null;
+    return { rows, group, members };
+}
+
+/**
+ * Merges the rows with these member IDs into the one with the lowest ID.
+ * Order matters for safety: (1) every removed row is copied in full to the
+ * Merge Log, (2) the kept row gets its new values, (3) only then are the
+ * removed rows deleted, after checking they are still where we read them.
+ */
+async function applyMerge(ids, adminName) {
+    const { group, members } = await loadGroup(ids);
+    if (!group) return { ok: false, reason: 'stale' };
+
+    const today = todayIL();
+    const plan = M.mergeGroup(members, today);
+    const keptId = str(plan.keep.values[COL.ID]);
+
+    await appendLog(plan.remove.map(r => [today, 'merged', keptId, str(r.values[COL.ID]), adminName || '', group.evidence.join(', '), ...pad(r.values)]));
+    await writeChanges(plan.keep.rowNumber, plan.changes);
+
+    // Delete bottom-up, and only rows that still carry the ID we expect
+    const check = await getClient().request({ url: `${BASE}/values/${tabRange('A1:A')}?valueRenderOption=UNFORMATTED_VALUE` });
+    const colA = (check.data.values || []).map(r => str(r[0]));
+    const toDelete = plan.remove
+        .map(r => {
+            const id = str(r.values[COL.ID]);
+            if (colA[r.rowNumber - 1] === id) return r.rowNumber;
+            const moved = colA.findIndex(v => v === id);
+            return moved >= 0 ? moved + 1 : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => b - a);
+    const tabs = await loadTabs();
+    if (toDelete.length) {
+        await getClient().request({
+            url: `${BASE}:batchUpdate`,
+            method: 'POST',
+            data: {
+                requests: toDelete.map(rowNumber => ({
+                    deleteDimension: { range: { sheetId: tabs[SHEET_TAB], dimension: 'ROWS', startIndex: rowNumber - 1, endIndex: rowNumber } },
+                })),
+            },
+        });
+    }
+
+    return {
+        ok: true,
+        keptId,
+        removedIds: plan.remove.map(r => str(r.values[COL.ID])),
+        merged: plan.merged,
+        warnings: plan.warnings,
+    };
+}
+
+/** Records that these rows are different people, so the scan stops suggesting them. */
+async function markDifferent(ids, adminName) {
+    const today = todayIL();
+    const sorted = [...ids].map(String).sort((a, b) => Number(a) - Number(b));
+    const entries = [];
+    for (let i = 0; i < sorted.length; i++) {
+        for (let j = i + 1; j < sorted.length; j++) entries.push([today, 'different', sorted[i], sorted[j], adminName || '', '']);
+    }
+    await appendLog(entries);
+}
+
+/**
+ * Step 1 of the clean-up: fill missing Telegram IDs from the bot's own records,
+ * and fix phones an earlier version of the bot saved without "+" or the 0.
+ * Only empty Telegram ID cells and clearly malformed phones are touched.
+ * `known`: [{ telegramId, memberId, phone, name }] from the bot's applicants table.
+ * @returns {{tg: Array, phones: Array, conflicts: Array, apply: () => Promise}}
+ */
+async function planBackfill(known) {
+    const rows = await readMembers();
+    const edits = new Map();
+    const tg = [];
+    const phones = [];
+    const conflicts = [];
+    const add = (row, col, value) => {
+        if (!edits.has(row.rowNumber)) edits.set(row.rowNumber, {});
+        edits.get(row.rowNumber)[col] = value;
+    };
+
+    if (tgColumnState) {
+        const owned = new Set(rows.map(r => str(r.values[COL.TG_ID])).filter(Boolean));
+        for (const k of known) {
+            const tid = String(k.telegramId);
+            if (owned.has(tid)) continue;
+            const words = str(k.name).split(/\s+/);
+            const probe = pad([]);
+            probe[COL.FIRST] = words[0] || '';
+            probe[COL.LAST] = words.slice(1).join(' ');
+            probe[COL.PHONE] = k.phone || '';
+            // The row the bot wrote for this person, if it still looks like them...
+            let row = k.memberId ? rows.find(r => str(r.values[COL.ID]) === String(k.memberId)) : null;
+            if (row && !(phonesMatch(row.values[COL.PHONE], k.phone) || compareNames(row.values, probe))) row = null;
+            // ...otherwise a row with the same phone
+            if (!row && phoneUsable(k.phone)) {
+                const hits = rows.filter(r => phonesMatch(r.values[COL.PHONE], k.phone));
+                if (hits.length === 1) row = hits[0];
+            }
+            if (!row) continue;
+            if (str(row.values[COL.TG_ID])) {
+                if (str(row.values[COL.TG_ID]) !== tid) conflicts.push({ memberId: row.values[COL.ID], name: M.displayName(row.values) });
+                continue;
+            }
+            add(row, COL.TG_ID, tid);
+            owned.add(tid);
+            tg.push({ memberId: row.values[COL.ID], name: M.displayName(row.values) });
+        }
+    }
+
+    for (const r of rows) {
+        const cur = str(r.values[COL.PHONE]);
+        if (!cur || !phoneUsable(cur)) continue;
+        const fixed = phoneCell(cur).replace(/^'/, '');
+        if (fixed !== cur) {
+            add(r, COL.PHONE, fixed);
+            phones.push({ memberId: r.values[COL.ID], name: M.displayName(r.values), from: cur, to: fixed });
+        }
+    }
+
+    return {
+        tg, phones, conflicts,
+        apply: () => writeCells([...edits.entries()].map(([rowNumber, changes]) => ({ rowNumber, changes }))),
+    };
 }
 
 module.exports = {
     COL,
-    getNextMemberId, saveMember, lookupMember, scanDuplicates,
-    // pure helpers, exported for tests
-    normalizePhone, phonesMatch, phoneCell, findMatch, mergeRow, findDuplicateGroups, safeCell,
+    getNextMemberId, saveMember, lookupMember,
+    scanDuplicates, loadGroup, applyMerge, markDifferent, planBackfill,
+    // pure helpers, re-exported for tests and older callers
+    normalizePhone: M.normalizePhone, phonesMatch, phoneCell, findMatch: M.findMatch,
+    mergeRow: M.mergeRow, findDuplicateGroups: M.findDuplicateGroups, safeCell,
 };

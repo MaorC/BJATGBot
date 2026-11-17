@@ -25,6 +25,7 @@ const { message } = require('telegraf/filters');
 const { createClient } = require('@supabase/supabase-js');
 const dotenv = require('dotenv');
 const sheets = require('./sheets');
+const matching = require('./matching');
 const { createInterview } = require('./interview');
 
 dotenv.config();
@@ -44,6 +45,8 @@ const SUPA_TABLE = process.env.SUPABASE_TABLE; // Status/Config table
 const SUPA_KEY = process.env.SUPABASE_KEY_NAME; // Key for 'enabled' state
 
 const BOT_USERNAME = 'BlueJayAviationBot';
+const MAOR_USERNAME = 'maor_c';   // where rejected applicants are referred for a conversation
+const MAOR_URL = `https://t.me/${MAOR_USERNAME}`;
 
 /**
  * Single source of truth for community groups. `key` is the stable slug used
@@ -250,7 +253,7 @@ function getAdminPanel() {
                 [{ text: '📥 Fetch Legacy', callback_data: 'admin_fetch' }, { text: '🧹 Clean Legacy', callback_data: 'admin_clean' }],
                 [{ text: '🚫 Ban user', callback_data: 'admin_ban' }],
                 [{ text: '➕ הוספה לקבוצה', callback_data: 'admin_addgroup' }],
-                [{ text: '🔎 סריקת כפילויות בגיליון', callback_data: 'admin_dupes' }],
+                [{ text: '🧹 ניקוי כפילויות בגיליון', callback_data: 'cl:start' }],
                 [{ text: '🔗 Post Links to Channel', callback_data: 'admin_links' }],
                 [{ text: '🔙 Back', callback_data: 'back_home' }]
             ]
@@ -391,7 +394,7 @@ async function stampCard(applicant, stamp, keyboard) {
     }
 }
 
-const MATCH_LABELS = { telegram: 'חשבון טלגרם זהה', phone: 'טלפון זהה', name: 'שם זהה' };
+const MATCH_LABELS = matching.MATCH_LABELS_HE;
 
 /** Rejects after `ms` so a hanging Google request can't run the function into its time limit. */
 const withTimeout = (promise, ms, label) => Promise.race([
@@ -523,6 +526,20 @@ async function approveRetro(applicant) {
     await stampCard(fresh, `✅ <b>אושר בדיעבד</b> · ${nowIL()}\n${sheetNote}`);
 }
 
+/** Buttons offered to anyone whose application was declined. */
+function appealKeyboard() {
+    return {
+        inline_keyboard: [
+            [{ text: '📝 הגשת ערעור', callback_data: 'ap:open' }],
+            [{ text: '📞 תיאום שיחה עם מאור', callback_data: 'ap:call' }],
+        ],
+    };
+}
+
+const PREVIOUSLY_REJECTED_MSG =
+    '🔵 הבקשה הקודמת שלך לא אושרה, ולכן אי אפשר להגיש בקשה חדשה באופן אוטומטי.\n\n' +
+    'אם משהו השתנה מאז (למשל התחלת הכשרה), אפשר להגיש ערעור או לתאם שיחה עם מאור:';
+
 /**
  * `reason`, when given, is shown to the applicant: either one of the
  * REJECT_PRESETS or free text the admin typed in their private chat with the
@@ -546,12 +563,18 @@ async function rejectApplicant(applicant, adminId, reason) {
         await bot.telegram.declineChatJoinRequest(applicant.chat_requested, applicant.telegram_id).catch(() => {});
     }
 
+    // Keep the reason with the application, so a later appeal or call request shows it to admins
+    await interview.upsertApplicant({
+        telegram_id: applicant.telegram_id,
+        answers: { ...(applicant.answers || {}), _rej_reason: reason || '' },
+    });
+
     const reasonLine = reason ? `\n\n📝 סיבה: ${escapeHTML(reason)}` : '';
     let delivered = true;
     await bot.telegram.sendMessage(applicant.telegram_id,
         `🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה.${reasonLine}\n\n` +
-        `אם תרצה/י להגיב או לשאול שאלה, אפשר פשוט להשיב כאן בצ'אט ונציג מהצוות יחזור אליך. אפשר גם לפנות ישירות - <a href="tg://user?id=382965373">לחצו כאן</a>.`,
-        { parse_mode: 'HTML' }
+        `חושב/ת שטעינו, או שמשהו השתנה? אפשר להגיש ערעור, או לתאם שיחה עם מאור, בכפתורים כאן למטה.`,
+        { parse_mode: 'HTML', reply_markup: appealKeyboard() }
     ).catch((e) => {
         console.error('Rejection DM failed:', e.message);
         delivered = false;
@@ -678,12 +701,9 @@ async function startJoinFlow(ctx, key) {
 
     let applicant = await interview.getApplicant(userId);
 
-    // Previously rejected: no re-interview, point to Maor
+    // Previously rejected: no re-interview, offer an appeal or a call with Maor
     if (applicant?.status === 'rejected') {
-        return ctx.reply(
-            '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
-            { parse_mode: 'HTML' }
-        );
+        return ctx.reply(PREVIOUSLY_REJECTED_MSG, { reply_markup: appealKeyboard() });
     }
 
     // Already an approved member (e.g. joining another BJA group): straight to the real
@@ -764,10 +784,7 @@ bot.on('chat_join_request', async (ctx) => {
         // Previously rejected: auto-decline, point to @maor_c, no re-interview
         if (applicant?.status === 'rejected') {
             await ctx.telegram.declineChatJoinRequest(chatId, userId).catch(() => {});
-            return ctx.telegram.sendMessage(userId,
-                '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
-                { parse_mode: 'HTML' }
-            ).catch(() => {});
+            return ctx.telegram.sendMessage(userId, PREVIOUSLY_REJECTED_MSG, { reply_markup: appealKeyboard() }).catch(() => {});
         }
 
         // Already an approved member (e.g. joining another BJA group): straight in
@@ -833,6 +850,216 @@ bot.on('chat_join_request', async (ctx) => {
 
 
 // =============================================================================
+// SECTION 3.6: Appeals and call requests from declined applicants
+// =============================================================================
+
+const CALL_NOTIFY_GAP_MS = 12 * 60 * 60 * 1000;   // don't re-alert admins more than twice a day per person
+
+async function handleAppealAction(ctx, action) {
+    const userId = ctx.from.id;
+    const applicant = await interview.getApplicant(userId);
+    if (applicant?.status !== 'rejected') {
+        return ctx.reply('ℹ️ אין כרגע בקשה שלך שממתינה לערעור.', getExistingUserMenu(ADMINS.includes(userId)));
+    }
+    const a = applicant.answers || {};
+
+    if (action === 'ap:open') {
+        const userPatch = { user_id: userId, chat_mode: 'rejected_appeal' };
+        if (ctx.from.username) userPatch.username = ctx.from.username;
+        await supabase.from('users').upsert([userPatch], { onConflict: 'user_id' });
+        return ctx.reply(
+            '📝 כתוב/כתבי כאן את הערעור: מה השתנה, או מה חשוב שנדע. קישור ללינקדאין או לרישיון יעזור לנו.\n\n' +
+            'ההודעה תועבר לצוות, ונחזור אליך כאן בצ\'אט.'
+        );
+    }
+
+    // ap:call
+    const last = a._call_at ? Date.parse(a._call_at) : 0;
+    const alreadyAsked = last && Date.now() - last < CALL_NOTIFY_GAP_MS;
+    if (!alreadyAsked) {
+        const reason = a._rej_reason ? escapeHTML(a._rej_reason) : 'ללא סיבה';
+        await bot.telegram.sendMessage(FEEDBACK_CHANNEL_ID,
+            `📞 <b>בקשה לשיחה עם מאור</b>\n\n` +
+            `👤 ${escapeHTML(a.name || ctx.from.first_name || '')} (@${escapeHTML(ctx.from.username || 'אין')})\n` +
+            `🆔 ${userId}\n` +
+            `💬 <a href="tg://user?id=${userId}">פנייה ישירה למועמד</a>\n` +
+            `⛔ הבקשה נדחתה. סיבה: ${reason}\n` +
+            `🕒 ${nowIL()}`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '↩️ השב למועמד', callback_data: `aq:replyto:${userId}` }]] },
+            }
+        ).catch((e) => console.error('call request alert failed:', e.message));
+        await interview.upsertApplicant({ telegram_id: userId, answers: { ...a, _call_at: new Date().toISOString() } });
+    }
+    return ctx.reply(
+        alreadyAsked
+            ? '📞 הבקשה לשיחה כבר אצל מאור, והוא יחזור אליך. אפשר גם לכתוב לו ישירות:'
+            : '📞 העברנו למאור את הבקשה לשיחה, והוא יחזור אליך לתיאום. אפשר גם לכתוב לו ישירות עכשיו:',
+        { reply_markup: { inline_keyboard: [[{ text: '💬 כתיבה למאור בטלגרם', url: MAOR_URL }]] } }
+    );
+}
+
+
+// =============================================================================
+// SECTION 3.7: Member sheet clean-up (admin panel → 🧹)
+// Step 1 fills Telegram IDs from the bot's own records and fixes phones saved
+// without "+" or the 0. Step 2 walks through suspected duplicates one by one:
+// merge, mark as different people, or skip. Nothing changes without a tap, and
+// every merged-away row is copied in full to the "Merge Log" tab first.
+// All steps are stateless: each button carries what it needs and re-reads the sheet.
+// =============================================================================
+
+const shortRow = (v) => {
+    const C = matching.COL;
+    const parts = [
+        v[C.PHONE] || 'בלי טלפון',
+        v[C.STATUS] || '',
+        v[C.CATEGORY] && v[C.CATEGORY] !== 'Unknown' ? v[C.CATEGORY] : '',
+        v[C.LICENSE] || '',
+        v[C.TG_ID] ? 'TG ✓' : '',
+    ].filter(Boolean);
+    return parts.map(x => escapeHTML(String(x))).join(' · ');
+};
+
+async function knownApplicantsForBackfill() {
+    const { data } = await supabase.from('applicants').select('telegram_id, member_id, answers, status').eq('status', 'approved');
+    return (data || []).map(a => ({
+        telegramId: a.telegram_id,
+        memberId: a.member_id,
+        phone: a.answers?.phone || '',
+        name: a.answers?.name || '',
+    }));
+}
+
+async function showBackfillStep(ctx) {
+    const plan = await withTimeout(sheets.planBackfill(await knownApplicantsForBackfill()), 8000, 'sheet read');
+    if (!plan.tg.length && !plan.phones.length) return showDuplicate(ctx, 0, '✅ שלב 1: אין פרטים להשלים.\n\n');
+
+    const list = (items, fmt) => items.slice(0, 12).map(fmt).join('\n') + (items.length > 12 ? `\n...ועוד ${items.length - 12}` : '');
+    let text = '🧹 <b>ניקוי הגיליון, שלב 1 מתוך 2: השלמת פרטים</b>\n\n';
+    if (plan.tg.length) {
+        text += `🔗 <b>${plan.tg.length} חברים יקבלו Telegram ID</b> מהרשומות של הבוט (כדי שמיזוג לא יאבד את הקישור):\n` +
+            list(plan.tg, x => `#${escapeHTML(String(x.memberId))} ${escapeHTML(x.name)}`) + '\n\n';
+    }
+    if (plan.phones.length) {
+        text += `📱 <b>${plan.phones.length} טלפונים יתוקנו</b> (נשמרו בלי + או בלי 0):\n` +
+            list(plan.phones, x => `#${escapeHTML(String(x.memberId))} ${escapeHTML(x.from)} ← ${escapeHTML(x.to)}`) + '\n\n';
+    }
+    if (plan.conflicts.length) {
+        text += `⚠️ ${plan.conflicts.length} שורות כבר מחזיקות Telegram ID אחר ולא ישונו.\n\n`;
+    }
+    text += 'רק תאים ריקים של Telegram ID וטלפונים בפורמט שגוי משתנים. שום שורה לא נמחקת בשלב הזה.';
+    return ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+            [{ text: '✅ ביצוע והמשך לשלב 2', callback_data: 'cl:bf' }],
+            [{ text: '⏭️ דילוג לשלב 2', callback_data: 'cl:show:0' }],
+        ] },
+    });
+}
+
+async function showDuplicate(ctx, index, prefix = '') {
+    const groups = await withTimeout(sheets.scanDuplicates(), 8000, 'sheet read');
+    if (!groups.length) {
+        return ctx.reply(`${prefix}✅ <b>לא נמצאו כפילויות.</b> כל אדם מופיע בגיליון פעם אחת.`, { parse_mode: 'HTML' });
+    }
+    if (index >= groups.length) {
+        return ctx.reply(
+            `${prefix}🏁 עברת על כל ההצעות. נשארו ${groups.length} שדילגת עליהן, הן יופיעו שוב בפעם הבאה.`,
+            { reply_markup: { inline_keyboard: [[{ text: '🔁 מההתחלה', callback_data: 'cl:show:0' }]] } }
+        );
+    }
+
+    const g = groups[index];
+    const ids = g.members.map(m => m.memberId);
+    const plan = matching.mergeGroup(g.members, new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Jerusalem' }));
+    const C = matching.COL;
+    const v = plan.merged;
+    const why = g.evidence.map(e => matching.MATCH_LABELS_HE[e] || e).join(' + ');
+    const warn = [];
+    if (g.conflicts.includes('telegram') || plan.warnings.includes('two_telegram_accounts')) warn.push('לשתי השורות יש חשבון טלגרם שונה.');
+    if (g.conflicts.includes('phone')) warn.push('מספרי הטלפון שונים (אולי החליף מספר).');
+    if (g.conflicts.includes('name')) warn.push('אותו טלפון אבל שמות שונים (אולי בן משפחה).');
+
+    const text =
+        `${prefix}🧹 <b>שלב 2: כפילות אפשרית ${index + 1} מתוך ${groups.length}</b>\n` +
+        `התאמה: ${matching.LEVEL_LABELS_HE[g.level]} · ${escapeHTML(why)}\n\n` +
+        g.members.map(m => `<b>#${escapeHTML(String(m.memberId))} ${escapeHTML(m.name)}</b>\n${shortRow(m.values)}`).join('\n\n') +
+        `\n\n<b>אחרי מיזוג תישאר שורה #${escapeHTML(String(ids[0]))}</b> (הוותיקה):\n` +
+        `${escapeHTML(matching.displayName(v))} · ${shortRow(v)}` +
+        (v[C.AUTHORITY] ? `\nרשות: ${escapeHTML(v[C.AUTHORITY])}` : '') +
+        (v[C.RATINGS] ? ` · הגדרים: ${escapeHTML(v[C.RATINGS])}` : '') +
+        `\nשורה ${ids.slice(1).map(i => '#' + escapeHTML(String(i))).join(', ')} תימחק, ועותק מלא שלה יישמר בלשונית Merge Log.` +
+        (warn.length ? `\n\n⚠️ ${warn.join(' ')}` : '');
+
+    const idStr = ids.join('-');
+    return ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+            [{ text: '✅ מיזוג', callback_data: `cl:ok:${index}:${idStr}` }, { text: '🙅 אנשים שונים', callback_data: `cl:diff:${index}:${idStr}` }],
+            [{ text: '⏭️ דילוג', callback_data: `cl:show:${index + 1}` }, { text: '⏹️ סיום', callback_data: 'cl:stop' }],
+        ] },
+    });
+}
+
+async function handleCleanupAction(ctx, action) {
+    const [, verb, idxStr, idStr] = action.split(':');
+    const index = parseInt(idxStr, 10) || 0;
+    const next = { inline_keyboard: [[{ text: '➡️ להצעה הבאה', callback_data: `cl:show:${index}` }, { text: '⏹️ סיום', callback_data: 'cl:stop' }]] };
+
+    if (verb === 'start') return showBackfillStep(ctx);
+    if (verb === 'show') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        return showDuplicate(ctx, index);
+    }
+    if (verb === 'stop') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        return ctx.reply('⏹️ הניקוי הופסק. אפשר להמשיך מתי שרוצים מפאנל הניהול.');
+    }
+    if (verb === 'bf') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        const plan = await withTimeout(sheets.planBackfill(await knownApplicantsForBackfill()), 8000, 'sheet read');
+        await withTimeout(plan.apply(), 8000, 'sheet write');
+        return ctx.reply(
+            `✅ שלב 1 הושלם: ${plan.tg.length} Telegram ID נוספו, ${plan.phones.length} טלפונים תוקנו.`,
+            { reply_markup: { inline_keyboard: [[{ text: '➡️ לשלב 2: כפילויות', callback_data: 'cl:show:0' }]] } }
+        );
+    }
+
+    const ids = (idStr || '').split('-').filter(Boolean);
+    if (ids.length < 2) return ctx.reply('⚠️ הצעה לא תקינה.');
+    const by = ctx.from.first_name || String(ctx.from.id);
+
+    if (verb === 'ok') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        // No timeout here: a merge that is cut off half way is safe to repeat, but reporting
+        // "failed" while it actually finished would be misleading.
+        const res = await sheets.applyMerge(ids, by);
+        if (!res.ok) {
+            return ctx.reply('ℹ️ ההצעה הזו כבר לא עדכנית (השורות השתנו או כבר מוזגו). שום דבר לא שונה.', { reply_markup: next });
+        }
+        // The bot's own records pointing at a removed row now point at the kept one
+        for (const removed of res.removedIds) {
+            await supabase.from('applicants').update({ member_id: parseInt(res.keptId, 10), sheet_row: null }).eq('member_id', parseInt(removed, 10));
+        }
+        return ctx.reply(
+            `✅ מוזג: נשארה שורה #${escapeHTML(res.keptId)}, ושורה ${res.removedIds.map(i => '#' + escapeHTML(i)).join(', ')} נמחקה (עותק בלשונית Merge Log). מוזג ע"י ${escapeHTML(by)}.`,
+            { parse_mode: 'HTML', reply_markup: next }
+        );
+    }
+    if (verb === 'diff') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await withTimeout(sheets.markDifferent(ids, by), 8000, 'sheet write');
+        return ctx.reply(
+            `🙅 סומן: ${ids.map(i => '#' + escapeHTML(i)).join(', ')} הם אנשים שונים. ההצעה לא תופיע שוב.`,
+            { parse_mode: 'HTML', reply_markup: next }
+        );
+    }
+}
+
+
+// =============================================================================
 // SECTION 4: Callback Query Handlers (Button Clicks)
 // =============================================================================
 
@@ -870,6 +1097,27 @@ bot.on('callback_query', async (ctx) => {
             console.error('interview callback error:', e);
         }
         return;
+    }
+
+    // --- Declined applicant: appeal or ask for a call with Maor ---
+    if (action === 'ap:open' || action === 'ap:call') {
+        try {
+            return await handleAppealAction(ctx, action);
+        } catch (e) {
+            console.error('appeal action error:', e);
+            return ctx.reply('⚠️ משהו השתבש, נסה/י שוב בעוד רגע.');
+        }
+    }
+
+    // --- Admin: duplicate clean-up of the member sheet ---
+    if (action.startsWith('cl:')) {
+        if (!isAdmin) return ctx.reply('❌ Unauthorized.');
+        try {
+            return await handleCleanupAction(ctx, action);
+        } catch (e) {
+            console.error('cleanup action error:', e);
+            return ctx.reply('⚠️ הפעולה נכשלה (ייתכן שהגיליון לא זמין כרגע). שום דבר לא נמחק. אפשר לנסות שוב.');
+        }
     }
 
     // --- Admin decisions on applicants ---
@@ -1196,32 +1444,6 @@ bot.on('callback_query', async (ctx) => {
         case 'admin_addgroup':
             await setUserMode(userId, 'addgroup_waiting');
             return ctx.reply('✍️ שלח/י Telegram ID או @username של החבר להוספה לקבוצה:');
-        case 'admin_dupes': {
-            let groups;
-            try {
-                groups = await sheets.scanDuplicates();
-            } catch (e) {
-                console.error('Duplicate scan failed:', e.message);
-                return ctx.reply('⚠️ הסריקה נכשלה - לא הצלחתי לקרוא את הגיליון.');
-            }
-            if (!groups.length) return ctx.reply('✅ לא נמצאו כפילויות בגיליון.');
-            const why = { telegram: 'חשבון טלגרם זהה', phone: 'טלפון זהה', name: 'שם זהה' };
-            // Telegram caps a message at 4096 characters: list as many cases as fit comfortably
-            const lines = [];
-            let used = 0;
-            for (const [i, g] of groups.entries()) {
-                const line = `${i + 1}. ${why[g.reason]}: ` +
-                    g.members.map(m => `#${escapeHTML(String(m.memberId || '?'))} ${escapeHTML(m.name)} (שורה ${m.rowNumber})`).join(' ↔ ');
-                if (used + line.length > 3200) break;
-                lines.push(line);
-                used += line.length + 1;
-            }
-            const more = groups.length > lines.length ? `\n\n...ועוד ${groups.length - lines.length} שלא נכנסו להודעה.` : '';
-            return ctx.reply(
-                `🔎 <b>סריקת כפילויות בגיליון</b>\n\nנמצאו ${groups.length} מקרים של שורות שנראות כמו אותו אדם. הסריקה לא משנה אף שורה בגיליון.\n\n${lines.join('\n')}${more}`,
-                { parse_mode: 'HTML' }
-            );
-        }
         case 'admin_links':
             const linkText = `🔵 ברוכים הבאים לערוץ <b>Blue Jay Aviation</b>!\n\n📌 <b>הקבוצות שלנו</b> - לחצו על הקבוצה שמעניינת אתכם כדי להתחיל תהליך הצטרפות קצר דרך הבוט:\n\nטיסות בטוחות! ✈️`;
             await ctx.telegram.sendMessage(parseInt(CHANNEL_ID), linkText, {

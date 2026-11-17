@@ -345,7 +345,7 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, 
         await sendAdminCard(applicant.telegram_id);
     }
 
-    const MATCH_BY = { telegram: 'חשבון טלגרם זהה', phone: 'טלפון זהה', name: 'שם זהה', member: 'חבר קיים' };
+    const MATCH_BY = require('./matching').MATCH_LABELS_HE;
 
     function matchLine(a) {
         const m = a._match;

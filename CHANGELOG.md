@@ -8,31 +8,35 @@ Labels: **Admins** (what the team sees), **Applicants** (what members see), **Sh
 
 ---
 
-## [Pending] Rejection reasons fixed, sheet becomes one row per person
+## [Pending] Rejections reach applicants, appeals and calls with Maor, one row per person
 PR #1, branch `fix/reject-reason-and-sheet-dedupe`. Not live until merged.
 
 **Fixed**
 - A rejection reason typed in the admin chat was silently lost. The bot never reads text in that chat, so the applicant got no message, stayed "pending", and the card lost its buttons. The admin's next private message to the bot would also have been sent to that applicant as the reason.
-- Every approval added a new sheet row, so a returning member got a duplicate.
+- Every approval added a new sheet row. 4 members already have two rows because of it (#151/#359, #166/#363, #228/#361, #307/#358): the old row is in English, the bot's row in Hebrew.
+- The bot saved phones without "+" or without the leading 0 (7 rows, #358 to #364).
 - Updates found rows by row number, so sorting the sheet could overwrite the wrong member and blank Employer and Aircraft.
 
 **Admins**
-- ⛔ דחייה now opens a reason picker on the card: 3 ready reasons, "סיבה אחרת", "ללא סיבה", ביטול.
+- ⛔ דחייה opens a reason picker on the card: 3 ready reasons, "סיבה אחרת", "ללא סיבה", ביטול.
 - "סיבה אחרת" and "השב למועמד" are typed in the private chat with the bot, with a preview before anything is sent.
-- Each decision is stamped on the card: who decided, when, the reason, what happened in the sheet, and whether the applicant actually received the message.
-- The card shows whether the applicant is already in the sheet, with buttons to overrule: 🆕 אישור כחבר חדש, 🔗 אישור + מיזוג.
-- Admin panel: 🔎 סריקת כפילויות בגיליון, a read-only list of rows that look like the same person.
+- Each decision is stamped on the card: who, when, the reason, what happened in the sheet, and whether the applicant received the message.
+- The card says whether the applicant is already in the sheet (also across Hebrew and English spelling), with buttons to overrule: 🆕 אישור כחבר חדש, 🔗 אישור + מיזוג.
+- New "📞 בקשה לשיחה עם מאור" card when a declined applicant asks for a call.
+- Admin panel: 🧹 ניקוי כפילויות בגיליון. Step 1 fills Telegram IDs from the bot's records and fixes phone formats. Step 2 shows each suspected duplicate with merge / different people / skip.
 
 **Applicants**
-- The rejection message now actually arrives, with the reason when one was chosen.
+- The rejection message arrives, with the reason when one was chosen, and two buttons: 📝 הגשת ערעור, 📞 תיאום שיחה עם מאור (direct link to t.me/maor_c).
+- Someone declined earlier who tries to join again gets the same two options instead of a dead end.
 
 **Sheet**
 - New column R, Telegram ID, added automatically.
-- Matching order: Telegram ID, then phone, then full name (name only: an admin decides).
-- An update writes only the cells that changed. The bot never touches the ID, listed name, Employer, Aircraft or Join Date. Replaced values are kept in Notes.
-- Phones are stored as +972 text. Applicant text can't act as a formula.
+- Matching: Telegram ID, phone in any format, phone one digit off, and name including Hebrew against English. Only a Telegram ID or phone match updates a row on its own; anything weaker is an admin's call.
+- An update writes only the cells that changed. Never touched: ID, listed name, Employer, Aircraft, Join Date. Replaced values go to Notes.
+- A merge keeps the lowest ID (seniority) and copies the removed row in full to a new "Merge Log" tab first. "Different people" decisions are logged there too and never suggested again.
+- Phones stored as +972 text. Applicant text can't act as a formula.
 
-Tested: 152/152 sandbox checks.
+Tested: 196/196 sandbox checks, plus a dry run of the matching on the real sheet (4 duplicate pairs found, no false matches among 330 legacy members).
 
 ## 2026-10-16: Appeals after rejection, Commercial Aviation check
 Commit `d97c3cf` (uploaded by hand; written as `9432ffe` and `805bde4`).
