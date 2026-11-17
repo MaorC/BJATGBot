@@ -9,6 +9,9 @@
  *   telegram_id, username, tg_first_name, chat_requested, state, answers(jsonb),
  *   status: in_progress | submitted | approved | rejected | retro_pending
  *   needs_verification, verification_reasons, sheet_row, member_id, ...
+ *   Keys in `answers` starting with "_" are bot bookkeeping, never written to the sheet:
+ *   _card (where the admin card is), _match (sheet lookup result shown on the card),
+ *   _draft (admin text awaiting confirmation), _admin_pick (group picker selection).
  *
  * Callback data prefixes (Telegram limit 64 bytes):
  *   iv:<question>:<option>  - interview answers
@@ -110,7 +113,7 @@ const VERIFICATION_MSG =
 
 // --- Factory ---
 
-function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, GROUP_LINKS = [] }) {
+function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, GROUP_LINKS = [], sheets = null }) {
 
     const groupLabel = (key) => (GROUP_LINKS.find(g => g.key === key) || {}).text || key;
 
@@ -314,10 +317,49 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, 
         await telegram.sendMessage(chatId, CLOSING_MSG, { parse_mode: 'HTML', reply_markup: { remove_keyboard: true } });
         if (needsVerification) await telegram.sendMessage(chatId, VERIFICATION_MSG);
 
+        // Does this person already have a row in the member sheet? Shown on the
+        // admin card; checked again for real at approval time (sheets.saveMember).
+        // Done after the applicant got their confirmation so they never wait on it.
+        if (sheets) {
+            const answers = { ...(applicant.answers || {}) };
+            delete answers._match;
+            delete answers._match_error;
+            try {
+                // Hard time limit: a slow Google response must never hold back the admin card
+                const m = await Promise.race([
+                    sheets.lookupMember({
+                        telegramId: applicant.telegram_id,
+                        phone: answers.phone,
+                        name: answers.name,
+                    }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('sheet lookup timed out')), 5000)),
+                ]);
+                if (m) answers._match = { s: m.strength, by: m.by, id: m.memberId, name: m.name };
+            } catch (e) {
+                console.error('Sheet lookup failed:', e.message);
+                answers._match_error = true;
+            }
+            await upsertApplicant({ telegram_id: applicant.telegram_id, answers });
+        }
+
         await sendAdminCard(applicant.telegram_id);
     }
 
-    function summaryText(applicant) {
+    const MATCH_BY = require('./matching').MATCH_LABELS_HE;
+
+    function matchLine(a) {
+        const m = a._match;
+        if (m && m.s === 'strong') {
+            return `🗂️ <b>כבר קיים בגיליון:</b> #${escapeHTML(String(m.id))} ${escapeHTML(m.name)} (${MATCH_BY[m.by] || m.by}). באישור תתעדכן השורה הקיימת, בלי כפילות.`;
+        }
+        if (m) {
+            return `🗂️ <b>ייתכן שכבר קיים בגיליון:</b> #${escapeHTML(String(m.id))} ${escapeHTML(m.name)} (${MATCH_BY[m.by] || m.by}). אם זה אותו אדם, אפשר לבחור "אישור + מיזוג" למטה.`;
+        }
+        if (a._match_error) return '🗂️ בדיקת הכפילויות בגיליון לא הצליחה כרגע, היא תתבצע שוב בעת האישור.';
+        return '🗂️ לא נמצא בגיליון, יתווסף כחבר חדש.';
+    }
+
+    function summaryText(applicant, { decided = false } = {}) {
         const a = applicant.answers || {};
         const lines = [
             `🛬 <b>בקשת הצטרפות חדשה</b>`,
@@ -338,28 +380,44 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, 
 
         const reasons = applicant.verification_reasons || [];
         if (reasons.length) lines.push('', `⚠️ <b>דורש אימות:</b> ${reasons.join('; ')}`);
+        // Once a decision is stamped on the card the sheet result is part of the stamp
+        if (sheets && !decided) lines.push('', matchLine(a));
         return lines.join('\n');
     }
 
     /** The default approve/reject card keyboard - also used to restore the card after "🔙 ביטול" on the group picker. */
-    function pendingCardKeyboard(telegramId) {
-        return {
-            inline_keyboard: [[
-                { text: '✅ אישור', callback_data: `aq:app:${telegramId}` },
-                { text: '⛔ דחייה', callback_data: `aq:rej:${telegramId}` },
-            ], [
-                { text: '📋 השלמה ידנית', callback_data: `aq:fill:${telegramId}` },
-                { text: '🔀 בחירת קבוצות', callback_data: `aq:groups:${telegramId}` },
-            ]],
-        };
+    function pendingCardKeyboard(telegramId, match = null) {
+        const rows = [[
+            { text: '✅ אישור', callback_data: `aq:app:${telegramId}` },
+            { text: '⛔ דחייה', callback_data: `aq:rej:${telegramId}` },
+        ]];
+        // Let the admin overrule the automatic sheet decision in either direction
+        if (match && match.s === 'strong') {
+            rows.push([{ text: '🆕 אישור כחבר חדש (בלי מיזוג)', callback_data: `aq:appnew:${telegramId}` }]);
+        } else if (match) {
+            rows.push([{ text: `🔗 אישור + מיזוג עם #${match.id}`, callback_data: `aq:appmerge:${telegramId}` }]);
+        }
+        rows.push([
+            { text: '📋 השלמה ידנית', callback_data: `aq:fill:${telegramId}` },
+            { text: '🔀 בחירת קבוצות', callback_data: `aq:groups:${telegramId}` },
+        ]);
+        return { inline_keyboard: rows };
     }
 
     async function sendAdminCard(telegramId) {
         const applicant = await getApplicant(telegramId);
-        await telegram.sendMessage(FEEDBACK_CHANNEL_ID, summaryText(applicant), {
+        const sent = await telegram.sendMessage(FEEDBACK_CHANNEL_ID, summaryText(applicant), {
             parse_mode: 'HTML',
-            reply_markup: pendingCardKeyboard(telegramId),
+            reply_markup: pendingCardKeyboard(telegramId, applicant.answers?._match),
         });
+        // Remember where the card is, so a decision completed elsewhere (a custom
+        // rejection reason typed in the admin's private chat) can still stamp it.
+        if (sent?.message_id) {
+            await upsertApplicant({
+                telegram_id: telegramId,
+                answers: { ...(applicant.answers || {}), _card: { c: sent.chat?.id ?? FEEDBACK_CHANNEL_ID, m: sent.message_id } },
+            });
+        }
     }
 
     // ---------- Sheet row building ----------
@@ -384,7 +442,7 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, 
         const [firstName, ...rest] = (a.name || '').trim().split(/\s+/);
         const today = new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Jerusalem' });
 
-        // A:Q order - must match the Members tab exactly
+        // A:R order - must match the Members tab exactly
         return [
             '',                                                            // A ID (filled by sheets.js)
             firstName || '',                                               // B First Name
@@ -403,6 +461,7 @@ function createInterview({ supabase, telegram, escapeHTML, FEEDBACK_CHANNEL_ID, 
             today,                                                         // O Join Date
             notes.join('; '),                                              // P Notes
             review.join('; '),                                             // Q Needs Review
+            String(applicant.telegram_id || ''),                           // R Telegram ID
         ];
     }
 

@@ -11,6 +11,13 @@
  *    chat with the bot before the interview DM is attempted, and only then hands out the
  *    real group invite link. The native chat_join_request handler below stays in place as
  *    a fallback safety net for anyone who still arrives via an old/raw invite link.
+ * 5. Admin decisions happen on the applicant's card in the admin chat. The bot never reads
+ *    free text typed in that chat: a rejection reason is either a one-tap preset, or typed
+ *    in the admin's PRIVATE chat with the bot and confirmed in a preview before it is sent.
+ *    Every decision is stamped on the card (who, when, sheet result, delivery status).
+ * 6. The member sheet is one row per person: sheets.saveMember() updates the person's
+ *    existing row (matched by Telegram ID, phone, or the row this bot wrote earlier) and
+ *    only otherwise adds one. See sheets.js for the merge rules.
  */
 
 const { Telegraf } = require('telegraf');
@@ -18,6 +25,7 @@ const { message } = require('telegraf/filters');
 const { createClient } = require('@supabase/supabase-js');
 const dotenv = require('dotenv');
 const sheets = require('./sheets');
+const matching = require('./matching');
 const { createInterview } = require('./interview');
 
 dotenv.config();
@@ -37,6 +45,8 @@ const SUPA_TABLE = process.env.SUPABASE_TABLE; // Status/Config table
 const SUPA_KEY = process.env.SUPABASE_KEY_NAME; // Key for 'enabled' state
 
 const BOT_USERNAME = 'BlueJayAviationBot';
+const MAOR_USERNAME = 'maor_c';   // where rejected applicants are referred for a conversation
+const MAOR_URL = `https://t.me/${MAOR_USERNAME}`;
 
 /**
  * Single source of truth for community groups. `key` is the stable slug used
@@ -70,7 +80,31 @@ const interview = createInterview({
   escapeHTML,
   FEEDBACK_CHANNEL_ID,
   GROUP_LINKS,
+  sheets,
 });
+
+/**
+ * One-tap rejection reasons shown to the admin after "⛔ דחייה". `text` is what
+ * the applicant reads after "📝 סיבה:". Edit freely; keep `code` short and unique.
+ */
+const REJECT_PRESETS = [
+  {
+    code: 'notyet',
+    label: '🎓 עוד לא בתהליך הכשרה',
+    text: 'הקהילה מיועדת לטייסים שכבר נמצאים בתהליך מקצועי לקראת רישיון מסחרי. כשתתחיל/י את ההכשרה, נשמח לבחון את הבקשה מחדש.',
+  },
+  {
+    code: 'verify',
+    label: '🛂 לא ניתן לאמת את הפרטים',
+    text: 'לא הצלחנו לאמת את הפרטים שנמסרו בבקשה. פרטים נוספים (למשל קישור ללינקדאין) יעזרו לנו לבחון אותה מחדש.',
+  },
+  {
+    code: 'partial',
+    label: '🧩 פרטים חסרים',
+    text: 'הפרטים שנמסרו בבקשה חלקיים מדי כדי שנוכל לאשר אותה.',
+  },
+];
+const MAX_ADMIN_TEXT = 1000;
 
 
 // =============================================================================
@@ -219,6 +253,7 @@ function getAdminPanel() {
                 [{ text: '📥 Fetch Legacy', callback_data: 'admin_fetch' }, { text: '🧹 Clean Legacy', callback_data: 'admin_clean' }],
                 [{ text: '🚫 Ban user', callback_data: 'admin_ban' }],
                 [{ text: '➕ הוספה לקבוצה', callback_data: 'admin_addgroup' }],
+                [{ text: '🧹 ניקוי כפילויות בגיליון', callback_data: 'cl:start' }],
                 [{ text: '🔗 Post Links to Channel', callback_data: 'admin_links' }],
                 [{ text: '🔙 Back', callback_data: 'back_home' }]
             ]
@@ -315,29 +350,105 @@ async function resolveApprovedApplicant(input) {
     return data || null;
 }
 
+/** Reason-picker keyboard that replaces the card's buttons after "⛔ דחייה". */
+function rejectReasonKeyboard(tidStr) {
+    return {
+        inline_keyboard: [
+            ...REJECT_PRESETS.map(p => [{ text: p.label, callback_data: `aq:rejp:${tidStr}:${p.code}` }]),
+            [{ text: '✍️ סיבה אחרת (כתיבה חופשית)', callback_data: `aq:rejother:${tidStr}` }],
+            [{ text: '⏭️ דחייה ללא סיבה', callback_data: `aq:rejskip:${tidStr}` }],
+            [{ text: '🔙 ביטול', callback_data: `aq:rejback:${tidStr}` }],
+        ],
+    };
+}
+
+const REJECTED_CARD_KEYBOARD = (tidStr) => ({
+    inline_keyboard: [[
+        { text: '↩️ אשר בדיעבד', callback_data: `aq:retro:${tidStr}` },
+        { text: '📋 השלמה ידנית', callback_data: `aq:fill:${tidStr}` },
+    ]],
+});
+
+const nowIL = () => new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jerusalem' });
+const applicantName = (applicant) => applicant.answers?.name || applicant.tg_first_name || String(applicant.telegram_id);
+
 /**
- * Writes the applicant to the BJA Members sheet (update if a row already
- * exists), admits them to the requested group(s), and notifies them.
- * Sheet failures never lose data: answers stay in Supabase and admins are told.
+ * Writes the decision onto the applicant's admin card itself (who, when, what
+ * happened), so the admin chat doubles as a readable log. Works both when the
+ * button was pressed on the card and when the decision was completed elsewhere
+ * (the card's location is stored in answers._card). Returns false if the card
+ * could not be edited, so the caller can fall back to a plain reply.
+ */
+async function stampCard(applicant, stamp, keyboard) {
+    const ref = applicant.answers?._card;
+    if (!ref?.c || !ref?.m) return false;
+    try {
+        await bot.telegram.editMessageText(ref.c, ref.m, undefined,
+            `${interview.summaryText(applicant, { decided: true })}\n\n${stamp}`,
+            { parse_mode: 'HTML', reply_markup: keyboard || { inline_keyboard: [] }, link_preview_options: { is_disabled: true } }
+        );
+        return true;
+    } catch (e) {
+        console.error('Could not stamp admin card:', e.message);
+        return false;
+    }
+}
+
+const MATCH_LABELS = matching.MATCH_LABELS_HE;
+
+/** Rejects after `ms` so a hanging Google request can't run the function into its time limit. */
+const withTimeout = (promise, ms, label) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), ms)),
+]);
+
+/** Human-readable (Hebrew) line describing what happened in the member sheet. */
+function describeSheetResult(res) {
+    if (res.action === 'created') {
+        let line = `🗂️ נוסף לגיליון כחבר #${res.memberId}.`;
+        if (res.weakMatch) {
+            line += ` שימו לב: ייתכן שזה אותו אדם כמו #${escapeHTML(String(res.weakMatch.memberId))} (${MATCH_LABELS[res.weakMatch.by]}), השורה החדשה סומנה לבדיקה.`;
+        }
+        return line;
+    }
+    const by = MATCH_LABELS[res.match?.by];
+    const id = escapeHTML(String(res.memberId ?? res.match?.memberId ?? '?'));
+    let line = by
+        ? `🗂️ זוהה כחבר קיים #${id} (${by}): השורה הקיימת עודכנה, לא נוצרה כפילות.`
+        : `🗂️ השורה הקיימת בגיליון (#${id}) עודכנה.`;
+    if (res.replaced.length) line += `\nערכים שהוחלפו ונשמרו בהערות: ${escapeHTML(res.replaced.join(', '))}`;
+    return line;
+}
+
+/**
+ * Saves the applicant to the BJA Members sheet, admits them to the requested
+ * group(s), and notifies them. One person = one row: sheets.saveMember()
+ * updates the person's existing row when there is one (same Telegram ID or
+ * phone, or the row this bot wrote for them earlier) and only otherwise adds
+ * a row. Sheet failures never lose data: answers stay in Supabase and admins
+ * are told.
  * `overrideGroupKeys`, when given (from the admin card's group picker), sends
  * invite links for that exact set of groups instead of just the one requested.
+ * `mergeMode`: 'auto' (default) | 'new' (admin: different person, add a row) |
+ * 'merge' (admin: same person as the name-only match, update that row).
+ * Returns { sheetNote, delivered } for the admin-facing confirmation.
  */
-async function approveApplicant(applicant, adminId, overrideGroupKeys) {
+async function approveApplicant(applicant, adminId, overrideGroupKeys, mergeMode = 'auto') {
     const tid = applicant.telegram_id;
     let sheetNote = '';
 
     try {
         const row = interview.buildSheetRow(applicant);
-        if (applicant.sheet_row) {
-            row[0] = String(applicant.member_id || '');
-            await sheets.updateMemberRow(applicant.sheet_row, row);
-        } else {
-            const { memberId, rowNumber } = await sheets.appendMemberRow(row);
-            await interview.upsertApplicant({ telegram_id: tid, member_id: memberId, sheet_row: rowNumber });
-        }
+        const res = await withTimeout(sheets.saveMember(row, {
+            telegramId: tid,
+            knownMemberId: mergeMode === 'new' ? null : applicant.member_id,
+            mode: mergeMode,
+        }), 7000, 'sheet write');
+        await interview.upsertApplicant({ telegram_id: tid, member_id: res.memberId, sheet_row: res.rowNumber });
+        sheetNote = describeSheetResult(res);
     } catch (e) {
         console.error('Sheets write failed:', e.message);
-        sheetNote = '\n⚠️ הכתיבה לגיליון נכשלה - הנתונים שמורים ב-Supabase, יש להעתיק ידנית.';
+        sheetNote = '⚠️ הכתיבה לגיליון נכשלה - הנתונים שמורים ב-Supabase, יש להעתיק ידנית.';
     }
 
     let admittedDirectly = false;
@@ -366,36 +477,79 @@ async function approveApplicant(applicant, adminId, overrideGroupKeys) {
     const keysToSend = (overrideGroupKeys && overrideGroupKeys.length) ? overrideGroupKeys : (groupKey ? [groupKey] : []);
     const groupsToSend = keysToSend.map(k => GROUP_LINKS.find(g => g.key === k)).filter(Boolean);
 
+    let delivered = true;
+    const send = (text, extra) => bot.telegram.sendMessage(tid, text, extra).catch((e) => {
+        console.error('Approval DM failed:', e.message);
+        delivered = false;
+    });
+
     if (admittedDirectly && !(overrideGroupKeys && overrideGroupKeys.length)) {
-        await bot.telegram.sendMessage(tid,
-            '🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️'
-        ).catch(() => {});
+        await send('🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️');
     } else if (groupsToSend.length) {
         const joinLine = groupsToSend.length === 1
             ? `לחץ כדי להצטרף ל-${groupsToSend[0].text}:`
             : 'לחץ כדי להצטרף לקבוצות:';
-        await bot.telegram.sendMessage(tid,
+        await send(
             `🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\n${joinLine}`,
             { reply_markup: { inline_keyboard: groupsToSend.map(g => [{ text: g.text, url: g.url }]) } }
-        ).catch(() => {});
+        );
     } else {
-        await bot.telegram.sendMessage(tid,
-            '🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️'
-        ).catch(() => {});
+        await send('🔵 ברוך הבא ל-Blue Jay Aviation! הבקשה שלך אושרה 🎉\n\nטיסות בטוחות! ✈️');
     }
 
-    return sheetNote;
+    return { sheetNote, delivered };
 }
 
 /**
- * `reason`, when given, is shown to the applicant and comes from the admin
- * typing it in response to the "⛔ דחייה" prompt (aq:rej -> rejreason:<tid>
- * mode); null/undefined means the admin chose "⏭️ דחייה ללא סיבה".
+ * Shared tail of every admin approval button: approve, stamp the card with
+ * who/when/what happened in the sheet, and only post a separate message if
+ * the card itself could not be updated.
+ */
+async function approveAndReport(ctx, applicant, adminId, overrideGroupKeys, mergeMode) {
+    const { sheetNote, delivered } = await approveApplicant(applicant, adminId, overrideGroupKeys, mergeMode);
+    const deliveryNote = delivered ? '' : '\n⚠️ הודעת האישור לא נמסרה למועמד (ייתכן שחסם את הבוט). כדאי לפנות אליו ישירות.';
+    const stamp = `✅ <b>אושר</b> ע"י ${escapeHTML(ctx.from.first_name)} · ${nowIL()}\n${sheetNote}${deliveryNote}`;
+
+    const fresh = await interview.getApplicant(applicant.telegram_id) || applicant;
+    if (!fresh.answers?._card && ctx.callbackQuery?.message) {
+        fresh.answers = { ...(fresh.answers || {}), _card: { c: ctx.callbackQuery.message.chat.id, m: ctx.callbackQuery.message.message_id } };
+    }
+    if (await stampCard(fresh, stamp)) return;
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+    return ctx.reply(`✅ ${escapeHTML(applicantName(applicant))} אושר.\n${sheetNote}${deliveryNote}`, { parse_mode: 'HTML' });
+}
+
+/** Completes a retroactive approval (no admin click involved) and notes it on the original card. */
+async function approveRetro(applicant) {
+    const { sheetNote } = await approveApplicant(applicant, null);
+    const fresh = await interview.getApplicant(applicant.telegram_id) || applicant;
+    await stampCard(fresh, `✅ <b>אושר בדיעבד</b> · ${nowIL()}\n${sheetNote}`);
+}
+
+/** Buttons offered to anyone whose application was declined. */
+function appealKeyboard() {
+    return {
+        inline_keyboard: [
+            [{ text: '📝 הגשת ערעור', callback_data: 'ap:open' }],
+            [{ text: '📞 תיאום שיחה עם מאור', callback_data: 'ap:call' }],
+        ],
+    };
+}
+
+const PREVIOUSLY_REJECTED_MSG =
+    '🔵 הבקשה הקודמת שלך לא אושרה, ולכן אי אפשר להגיש בקשה חדשה באופן אוטומטי.\n\n' +
+    'אם משהו השתנה מאז (למשל התחלת הכשרה), אפשר להגיש ערעור או לתאם שיחה עם מאור:';
+
+/**
+ * `reason`, when given, is shown to the applicant: either one of the
+ * REJECT_PRESETS or free text the admin typed in their private chat with the
+ * bot and confirmed in a preview. null/undefined means "⏭️ דחייה ללא סיבה".
  * After rejecting, the applicant is put into a listening mode (chat_mode
  * 'rejected_appeal') so a reply they type isn't silently swallowed by the
  * generic menu fallback - it gets relayed to admins and can go back and
  * forth via the bot itself, which (unlike a tg://user?id= link) always
  * works once someone has messaged the bot, regardless of their privacy settings.
+ * Returns true when the decline message actually reached the applicant.
  */
 async function rejectApplicant(applicant, adminId, reason) {
     await interview.upsertApplicant({
@@ -409,12 +563,22 @@ async function rejectApplicant(applicant, adminId, reason) {
         await bot.telegram.declineChatJoinRequest(applicant.chat_requested, applicant.telegram_id).catch(() => {});
     }
 
+    // Keep the reason with the application, so a later appeal or call request shows it to admins
+    await interview.upsertApplicant({
+        telegram_id: applicant.telegram_id,
+        answers: { ...(applicant.answers || {}), _rej_reason: reason || '' },
+    });
+
     const reasonLine = reason ? `\n\n📝 סיבה: ${escapeHTML(reason)}` : '';
+    let delivered = true;
     await bot.telegram.sendMessage(applicant.telegram_id,
         `🔵 תודה על הפנייה ל-Blue Jay Aviation.\n\nלצערנו הבקשה לא אושרה בשלב זה.${reasonLine}\n\n` +
-        `אם תרצה/י להגיב או לשאול שאלה, אפשר פשוט להשיב כאן בצ'אט ונציג מהצוות יחזור אליך. אפשר גם לפנות ישירות - <a href="tg://user?id=382965373">לחצו כאן</a>.`,
-        { parse_mode: 'HTML' }
-    ).catch(() => {});
+        `חושב/ת שטעינו, או שמשהו השתנה? אפשר להגיש ערעור, או לתאם שיחה עם מאור, בכפתורים כאן למטה.`,
+        { parse_mode: 'HTML', reply_markup: appealKeyboard() }
+    ).catch((e) => {
+        console.error('Rejection DM failed:', e.message);
+        delivered = false;
+    });
 
     // Upsert (not setUserMode's plain update) so this works even for a legacy
     // chat_join_request applicant who may have no `users` row yet. Only include
@@ -425,6 +589,96 @@ async function rejectApplicant(applicant, adminId, reason) {
     const nameVal = applicant.answers?.name || applicant.tg_first_name;
     if (nameVal) userPatch.first_name = nameVal;
     await supabase.from('users').upsert([userPatch], { onConflict: 'user_id' });
+
+    return delivered;
+}
+
+/**
+ * Shared tail of every rejection path (preset, no reason, custom text):
+ * reject, then stamp the card with who/when/why and whether the applicant
+ * actually received the message. Returns the admin-facing summary line.
+ */
+async function rejectAndReport(ctx, applicant, reason) {
+    const delivered = await rejectApplicant(applicant, ctx.from.id, reason);
+    const tidStr = String(applicant.telegram_id);
+    const deliveryLine = delivered
+        ? '📨 ההודעה נמסרה למועמד.'
+        : '⚠️ ההודעה לא נמסרה למועמד (ייתכן שחסם את הבוט). כדאי לפנות אליו ישירות.';
+    const reasonLine = reason ? `📝 סיבה: ${escapeHTML(reason)}` : '📝 ללא סיבה';
+    const stamp = `⛔ <b>נדחה</b> ע"י ${escapeHTML(ctx.from.first_name)} · ${nowIL()}\n${reasonLine}\n${deliveryLine}`;
+
+    const fresh = await interview.getApplicant(applicant.telegram_id) || applicant;
+    const stamped = await stampCard(fresh, stamp, REJECTED_CARD_KEYBOARD(tidStr));
+    return { delivered, stamped, summary: `⛔ ${escapeHTML(applicantName(applicant))} נדחה.\n${reasonLine}\n${deliveryLine}` };
+}
+
+/**
+ * Sends the admin a prompt in their PRIVATE chat with the bot and arms the
+ * matching input mode. Free text is only ever collected there: the bot does
+ * not read text typed in the admin chat, which is how reasons used to get lost.
+ * `kind` is 'rejreason' or 'admin_reply'.
+ */
+async function promptAdminInPrivate(ctx, kind, applicant) {
+    const adminId = ctx.from.id;
+    const tidStr = String(applicant.telegram_id);
+    const name = escapeHTML(applicantName(applicant));
+    const prompt = kind === 'rejreason'
+        ? `✍️ <b>דחיית ${name}</b>\n\nכתוב/כתבי כאן את הסיבה. לפני שמשהו נשלח למועמד תוצג לך תצוגה מקדימה לאישור.\n\nלביטול: /cancel`
+        : `✍️ <b>תשובה ל-${name}</b>\n\nכתוב/כתבי כאן את התשובה. לפני השליחה תוצג לך תצוגה מקדימה לאישור.\n\nלביטול: /cancel`;
+
+    try {
+        await bot.telegram.sendMessage(adminId, prompt, { parse_mode: 'HTML' });
+    } catch (e) {
+        // The admin has never opened a private chat with the bot (or blocked it)
+        return ctx.reply(
+            `⚠️ ${escapeHTML(ctx.from.first_name)}, לא הצלחתי לשלוח לך הודעה פרטית. פתח/י את הצ'אט הפרטי עם הבוט, לחץ/י Start, ואז נסה/י שוב.`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🤖 פתיחת הצ\'אט עם הבוט', url: `https://t.me/${BOT_USERNAME}` }]] } }
+        );
+    }
+    // Upsert, not update: an admin who only ever worked from the admin chat may have no `users` row yet
+    await supabase.from('users').upsert([{ user_id: adminId, chat_mode: `${kind}:${tidStr}` }], { onConflict: 'user_id' });
+
+    if (ctx.chat?.type === 'private') {
+        // "✏️ כתיבה מחדש" on a preview: retire that preview so its Send button can't fire later
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+    } else {
+        return ctx.reply(
+            `✍️ ${escapeHTML(ctx.from.first_name)}, שלחתי לך הודעה בצ'אט הפרטי עם הבוט. הכתיבה נעשית שם.`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🤖 מעבר לצ\'אט עם הבוט', url: `https://t.me/${BOT_USERNAME}` }]] } }
+        );
+    }
+}
+
+/**
+ * Stores what the admin typed as a draft on the applicant and shows a preview
+ * with explicit Send / Rewrite / Cancel buttons. Nothing reaches the applicant
+ * until "send" is pressed, so a stray message to the bot can never be mistaken
+ * for a rejection reason.
+ */
+async function previewAdminDraft(ctx, kind, target, text) {
+    const tidStr = String(target.telegram_id);
+    const body = text.slice(0, MAX_ADMIN_TEXT);
+    const draftId = Math.random().toString(36).slice(2, 8);   // ties the preview's buttons to exactly this text
+    await interview.upsertApplicant({
+        telegram_id: target.telegram_id,
+        answers: { ...(target.answers || {}), _draft: { k: kind, t: body, n: draftId, by: ctx.from.id } },
+    });
+    const name = escapeHTML(applicantName(target));
+    const isRej = kind === 'rejreason';
+    const head = isRej ? `👀 <b>תצוגה מקדימה: דחיית ${name}</b>\n\n📝 סיבה: ` : `👀 <b>תצוגה מקדימה: תשובה ל-${name}</b>\n\n`;
+    const cut = text.length > MAX_ADMIN_TEXT ? `\n\n(הטקסט קוצר ל-${MAX_ADMIN_TEXT} תווים)` : '';
+    return ctx.reply(`${head}${escapeHTML(body)}${cut}\n\nלשלוח למועמד?`, {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: isRej ? '✅ שליחה ודחייה' : '✅ שליחה', callback_data: `aq:dsend:${tidStr}:${draftId}` }],
+                [
+                    { text: '✏️ כתיבה מחדש', callback_data: `aq:${isRej ? 'rejother' : 'replyto'}:${tidStr}` },
+                    { text: '🔙 ביטול', callback_data: `aq:ddrop:${tidStr}:${draftId}` },
+                ],
+            ],
+        },
+    });
 }
 
 /**
@@ -447,12 +701,9 @@ async function startJoinFlow(ctx, key) {
 
     let applicant = await interview.getApplicant(userId);
 
-    // Previously rejected: no re-interview, point to Maor
+    // Previously rejected: no re-interview, offer an appeal or a call with Maor
     if (applicant?.status === 'rejected') {
-        return ctx.reply(
-            '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
-            { parse_mode: 'HTML' }
-        );
+        return ctx.reply(PREVIOUSLY_REJECTED_MSG, { reply_markup: appealKeyboard() });
     }
 
     // Already an approved member (e.g. joining another BJA group): straight to the real
@@ -481,7 +732,7 @@ async function startJoinFlow(ctx, key) {
                 await notifyAdminGroupMismatch(applicant, key);
                 await ctx.reply(interview.GROUP_MISMATCH_NUDGE_EXTRA);
             } else {
-                await approveApplicant(applicant, null);
+                await approveRetro(applicant);
             }
         } else {
             await ctx.reply('🔵 כמעט שם! נשארו כמה פרטים קצרים להשלמה:');
@@ -533,10 +784,7 @@ bot.on('chat_join_request', async (ctx) => {
         // Previously rejected: auto-decline, point to @maor_c, no re-interview
         if (applicant?.status === 'rejected') {
             await ctx.telegram.declineChatJoinRequest(chatId, userId).catch(() => {});
-            return ctx.telegram.sendMessage(userId,
-                '🔵 בקשתך סורבה בעבר ולכן לא ניתן להגיש בקשה נוספת.\n\nלבירור - <a href="tg://user?id=382965373">לחצו כאן לפנייה ישירה למאור</a>',
-                { parse_mode: 'HTML' }
-            ).catch(() => {});
+            return ctx.telegram.sendMessage(userId, PREVIOUSLY_REJECTED_MSG, { reply_markup: appealKeyboard() }).catch(() => {});
         }
 
         // Already an approved member (e.g. joining another BJA group): straight in
@@ -549,7 +797,7 @@ bot.on('chat_join_request', async (ctx) => {
         if (applicant?.status === 'retro_pending') {
             applicant = await interview.upsertApplicant({ telegram_id: userId, chat_requested: chatId });
             if (interview.nextQuestion(applicant) === null) {
-                await approveApplicant(applicant, null);
+                await approveRetro(applicant);
             } else {
                 await ctx.telegram.sendMessage(userId, '🔵 כמעט שם! נשארו כמה פרטים קצרים להשלמה:').catch(() => {});
                 await interview.advance(userId, applicant);
@@ -602,6 +850,216 @@ bot.on('chat_join_request', async (ctx) => {
 
 
 // =============================================================================
+// SECTION 3.6: Appeals and call requests from declined applicants
+// =============================================================================
+
+const CALL_NOTIFY_GAP_MS = 12 * 60 * 60 * 1000;   // don't re-alert admins more than twice a day per person
+
+async function handleAppealAction(ctx, action) {
+    const userId = ctx.from.id;
+    const applicant = await interview.getApplicant(userId);
+    if (applicant?.status !== 'rejected') {
+        return ctx.reply('ℹ️ אין כרגע בקשה שלך שממתינה לערעור.', getExistingUserMenu(ADMINS.includes(userId)));
+    }
+    const a = applicant.answers || {};
+
+    if (action === 'ap:open') {
+        const userPatch = { user_id: userId, chat_mode: 'rejected_appeal' };
+        if (ctx.from.username) userPatch.username = ctx.from.username;
+        await supabase.from('users').upsert([userPatch], { onConflict: 'user_id' });
+        return ctx.reply(
+            '📝 כתוב/כתבי כאן את הערעור: מה השתנה, או מה חשוב שנדע. קישור ללינקדאין או לרישיון יעזור לנו.\n\n' +
+            'ההודעה תועבר לצוות, ונחזור אליך כאן בצ\'אט.'
+        );
+    }
+
+    // ap:call
+    const last = a._call_at ? Date.parse(a._call_at) : 0;
+    const alreadyAsked = last && Date.now() - last < CALL_NOTIFY_GAP_MS;
+    if (!alreadyAsked) {
+        const reason = a._rej_reason ? escapeHTML(a._rej_reason) : 'ללא סיבה';
+        await bot.telegram.sendMessage(FEEDBACK_CHANNEL_ID,
+            `📞 <b>בקשה לשיחה עם מאור</b>\n\n` +
+            `👤 ${escapeHTML(a.name || ctx.from.first_name || '')} (@${escapeHTML(ctx.from.username || 'אין')})\n` +
+            `🆔 ${userId}\n` +
+            `💬 <a href="tg://user?id=${userId}">פנייה ישירה למועמד</a>\n` +
+            `⛔ הבקשה נדחתה. סיבה: ${reason}\n` +
+            `🕒 ${nowIL()}`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '↩️ השב למועמד', callback_data: `aq:replyto:${userId}` }]] },
+            }
+        ).catch((e) => console.error('call request alert failed:', e.message));
+        await interview.upsertApplicant({ telegram_id: userId, answers: { ...a, _call_at: new Date().toISOString() } });
+    }
+    return ctx.reply(
+        alreadyAsked
+            ? '📞 הבקשה לשיחה כבר אצל מאור, והוא יחזור אליך. אפשר גם לכתוב לו ישירות:'
+            : '📞 העברנו למאור את הבקשה לשיחה, והוא יחזור אליך לתיאום. אפשר גם לכתוב לו ישירות עכשיו:',
+        { reply_markup: { inline_keyboard: [[{ text: '💬 כתיבה למאור בטלגרם', url: MAOR_URL }]] } }
+    );
+}
+
+
+// =============================================================================
+// SECTION 3.7: Member sheet clean-up (admin panel → 🧹)
+// Step 1 fills Telegram IDs from the bot's own records and fixes phones saved
+// without "+" or the 0. Step 2 walks through suspected duplicates one by one:
+// merge, mark as different people, or skip. Nothing changes without a tap, and
+// every merged-away row is copied in full to the "Merge Log" tab first.
+// All steps are stateless: each button carries what it needs and re-reads the sheet.
+// =============================================================================
+
+const shortRow = (v) => {
+    const C = matching.COL;
+    const parts = [
+        v[C.PHONE] || 'בלי טלפון',
+        v[C.STATUS] || '',
+        v[C.CATEGORY] && v[C.CATEGORY] !== 'Unknown' ? v[C.CATEGORY] : '',
+        v[C.LICENSE] || '',
+        v[C.TG_ID] ? 'TG ✓' : '',
+    ].filter(Boolean);
+    return parts.map(x => escapeHTML(String(x))).join(' · ');
+};
+
+async function knownApplicantsForBackfill() {
+    const { data } = await supabase.from('applicants').select('telegram_id, member_id, answers, status').eq('status', 'approved');
+    return (data || []).map(a => ({
+        telegramId: a.telegram_id,
+        memberId: a.member_id,
+        phone: a.answers?.phone || '',
+        name: a.answers?.name || '',
+    }));
+}
+
+async function showBackfillStep(ctx) {
+    const plan = await withTimeout(sheets.planBackfill(await knownApplicantsForBackfill()), 8000, 'sheet read');
+    if (!plan.tg.length && !plan.phones.length) return showDuplicate(ctx, 0, '✅ שלב 1: אין פרטים להשלים.\n\n');
+
+    const list = (items, fmt) => items.slice(0, 12).map(fmt).join('\n') + (items.length > 12 ? `\n...ועוד ${items.length - 12}` : '');
+    let text = '🧹 <b>ניקוי הגיליון, שלב 1 מתוך 2: השלמת פרטים</b>\n\n';
+    if (plan.tg.length) {
+        text += `🔗 <b>${plan.tg.length} חברים יקבלו Telegram ID</b> מהרשומות של הבוט (כדי שמיזוג לא יאבד את הקישור):\n` +
+            list(plan.tg, x => `#${escapeHTML(String(x.memberId))} ${escapeHTML(x.name)}`) + '\n\n';
+    }
+    if (plan.phones.length) {
+        text += `📱 <b>${plan.phones.length} טלפונים יתוקנו</b> (נשמרו בלי + או בלי 0):\n` +
+            list(plan.phones, x => `#${escapeHTML(String(x.memberId))} ${escapeHTML(x.from)} ← ${escapeHTML(x.to)}`) + '\n\n';
+    }
+    if (plan.conflicts.length) {
+        text += `⚠️ ${plan.conflicts.length} שורות כבר מחזיקות Telegram ID אחר ולא ישונו.\n\n`;
+    }
+    text += 'רק תאים ריקים של Telegram ID וטלפונים בפורמט שגוי משתנים. שום שורה לא נמחקת בשלב הזה.';
+    return ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+            [{ text: '✅ ביצוע והמשך לשלב 2', callback_data: 'cl:bf' }],
+            [{ text: '⏭️ דילוג לשלב 2', callback_data: 'cl:show:0' }],
+        ] },
+    });
+}
+
+async function showDuplicate(ctx, index, prefix = '') {
+    const groups = await withTimeout(sheets.scanDuplicates(), 8000, 'sheet read');
+    if (!groups.length) {
+        return ctx.reply(`${prefix}✅ <b>לא נמצאו כפילויות.</b> כל אדם מופיע בגיליון פעם אחת.`, { parse_mode: 'HTML' });
+    }
+    if (index >= groups.length) {
+        return ctx.reply(
+            `${prefix}🏁 עברת על כל ההצעות. נשארו ${groups.length} שדילגת עליהן, הן יופיעו שוב בפעם הבאה.`,
+            { reply_markup: { inline_keyboard: [[{ text: '🔁 מההתחלה', callback_data: 'cl:show:0' }]] } }
+        );
+    }
+
+    const g = groups[index];
+    const ids = g.members.map(m => m.memberId);
+    const plan = matching.mergeGroup(g.members, new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Jerusalem' }));
+    const C = matching.COL;
+    const v = plan.merged;
+    const why = g.evidence.map(e => matching.MATCH_LABELS_HE[e] || e).join(' + ');
+    const warn = [];
+    if (g.conflicts.includes('telegram') || plan.warnings.includes('two_telegram_accounts')) warn.push('לשתי השורות יש חשבון טלגרם שונה.');
+    if (g.conflicts.includes('phone')) warn.push('מספרי הטלפון שונים (אולי החליף מספר).');
+    if (g.conflicts.includes('name')) warn.push('אותו טלפון אבל שמות שונים (אולי בן משפחה).');
+
+    const text =
+        `${prefix}🧹 <b>שלב 2: כפילות אפשרית ${index + 1} מתוך ${groups.length}</b>\n` +
+        `התאמה: ${matching.LEVEL_LABELS_HE[g.level]} · ${escapeHTML(why)}\n\n` +
+        g.members.map(m => `<b>#${escapeHTML(String(m.memberId))} ${escapeHTML(m.name)}</b>\n${shortRow(m.values)}`).join('\n\n') +
+        `\n\n<b>אחרי מיזוג תישאר שורה #${escapeHTML(String(ids[0]))}</b> (הוותיקה):\n` +
+        `${escapeHTML(matching.displayName(v))} · ${shortRow(v)}` +
+        (v[C.AUTHORITY] ? `\nרשות: ${escapeHTML(v[C.AUTHORITY])}` : '') +
+        (v[C.RATINGS] ? ` · הגדרים: ${escapeHTML(v[C.RATINGS])}` : '') +
+        `\nשורה ${ids.slice(1).map(i => '#' + escapeHTML(String(i))).join(', ')} תימחק, ועותק מלא שלה יישמר בלשונית Merge Log.` +
+        (warn.length ? `\n\n⚠️ ${warn.join(' ')}` : '');
+
+    const idStr = ids.join('-');
+    return ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+            [{ text: '✅ מיזוג', callback_data: `cl:ok:${index}:${idStr}` }, { text: '🙅 אנשים שונים', callback_data: `cl:diff:${index}:${idStr}` }],
+            [{ text: '⏭️ דילוג', callback_data: `cl:show:${index + 1}` }, { text: '⏹️ סיום', callback_data: 'cl:stop' }],
+        ] },
+    });
+}
+
+async function handleCleanupAction(ctx, action) {
+    const [, verb, idxStr, idStr] = action.split(':');
+    const index = parseInt(idxStr, 10) || 0;
+    const next = { inline_keyboard: [[{ text: '➡️ להצעה הבאה', callback_data: `cl:show:${index}` }, { text: '⏹️ סיום', callback_data: 'cl:stop' }]] };
+
+    if (verb === 'start') return showBackfillStep(ctx);
+    if (verb === 'show') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        return showDuplicate(ctx, index);
+    }
+    if (verb === 'stop') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        return ctx.reply('⏹️ הניקוי הופסק. אפשר להמשיך מתי שרוצים מפאנל הניהול.');
+    }
+    if (verb === 'bf') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        const plan = await withTimeout(sheets.planBackfill(await knownApplicantsForBackfill()), 8000, 'sheet read');
+        await withTimeout(plan.apply(), 8000, 'sheet write');
+        return ctx.reply(
+            `✅ שלב 1 הושלם: ${plan.tg.length} Telegram ID נוספו, ${plan.phones.length} טלפונים תוקנו.`,
+            { reply_markup: { inline_keyboard: [[{ text: '➡️ לשלב 2: כפילויות', callback_data: 'cl:show:0' }]] } }
+        );
+    }
+
+    const ids = (idStr || '').split('-').filter(Boolean);
+    if (ids.length < 2) return ctx.reply('⚠️ הצעה לא תקינה.');
+    const by = ctx.from.first_name || String(ctx.from.id);
+
+    if (verb === 'ok') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        // No timeout here: a merge that is cut off half way is safe to repeat, but reporting
+        // "failed" while it actually finished would be misleading.
+        const res = await sheets.applyMerge(ids, by);
+        if (!res.ok) {
+            return ctx.reply('ℹ️ ההצעה הזו כבר לא עדכנית (השורות השתנו או כבר מוזגו). שום דבר לא שונה.', { reply_markup: next });
+        }
+        // The bot's own records pointing at a removed row now point at the kept one
+        for (const removed of res.removedIds) {
+            await supabase.from('applicants').update({ member_id: parseInt(res.keptId, 10), sheet_row: null }).eq('member_id', parseInt(removed, 10));
+        }
+        return ctx.reply(
+            `✅ מוזג: נשארה שורה #${escapeHTML(res.keptId)}, ושורה ${res.removedIds.map(i => '#' + escapeHTML(i)).join(', ')} נמחקה (עותק בלשונית Merge Log). מוזג ע"י ${escapeHTML(by)}.`,
+            { parse_mode: 'HTML', reply_markup: next }
+        );
+    }
+    if (verb === 'diff') {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await withTimeout(sheets.markDifferent(ids, by), 8000, 'sheet write');
+        return ctx.reply(
+            `🙅 סומן: ${ids.map(i => '#' + escapeHTML(i)).join(', ')} הם אנשים שונים. ההצעה לא תופיע שוב.`,
+            { parse_mode: 'HTML', reply_markup: next }
+        );
+    }
+}
+
+
+// =============================================================================
 // SECTION 4: Callback Query Handlers (Button Clicks)
 // =============================================================================
 
@@ -641,6 +1099,27 @@ bot.on('callback_query', async (ctx) => {
         return;
     }
 
+    // --- Declined applicant: appeal or ask for a call with Maor ---
+    if (action === 'ap:open' || action === 'ap:call') {
+        try {
+            return await handleAppealAction(ctx, action);
+        } catch (e) {
+            console.error('appeal action error:', e);
+            return ctx.reply('⚠️ משהו השתבש, נסה/י שוב בעוד רגע.');
+        }
+    }
+
+    // --- Admin: duplicate clean-up of the member sheet ---
+    if (action.startsWith('cl:')) {
+        if (!isAdmin) return ctx.reply('❌ Unauthorized.');
+        try {
+            return await handleCleanupAction(ctx, action);
+        } catch (e) {
+            console.error('cleanup action error:', e);
+            return ctx.reply('⚠️ הפעולה נכשלה (ייתכן שהגיליון לא זמין כרגע). שום דבר לא נמחק. אפשר לנסות שוב.');
+        }
+    }
+
     // --- Admin decisions on applicants ---
     if (action.startsWith('aq:')) {
         if (!isAdmin) return ctx.reply('❌ Unauthorized.');
@@ -649,34 +1128,86 @@ bot.on('callback_query', async (ctx) => {
         if (!applicant) return ctx.reply('⚠️ מועמד לא נמצא.');
 
         try {
-            if (verb === 'app') {
+            // --- Approve: default, or overruling the automatic sheet match in either direction ---
+            if (verb === 'app' || verb === 'appnew' || verb === 'appmerge') {
                 if (applicant.status === 'approved') return ctx.reply('ℹ️ כבר אושר.');
-                const note = await approveApplicant(applicant, userId);
-                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
-                return ctx.reply(`✅ ${applicant.answers?.name || tidStr} אושר ונוסף לגיליון.${note}`);
+                const mergeMode = verb === 'appnew' ? 'new' : verb === 'appmerge' ? 'merge' : 'auto';
+                return approveAndReport(ctx, applicant, userId, null, mergeMode);
+            }
+
+            // --- Reject: the card's buttons turn into a reason picker. Nothing is typed in
+            // the admin chat, and the card stays actionable until the rejection really happened. ---
+            const isRejectVerb = ['rej', 'rejp', 'rejskip', 'rejother'].includes(verb);
+            if (isRejectVerb && applicant.status === 'approved') {
+                return ctx.reply('ℹ️ המועמד כבר אושר, ולכן אי אפשר לדחות אותו מכאן.');
             }
             if (verb === 'rej') {
                 if (applicant.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
-                await setUserMode(userId, `rejreason:${tidStr}`);
-                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
-                return ctx.reply('✍️ כתוב/כתבי את הסיבה לדחייה (תישלח למועמד):', {
-                    reply_markup: { inline_keyboard: [[{ text: '⏭️ דחייה ללא סיבה', callback_data: `aq:rejskip:${tidStr}` }]] },
-                });
+                const msg = ctx.callbackQuery.message;
+                if (msg) {
+                    await interview.upsertApplicant({
+                        telegram_id: applicant.telegram_id,
+                        answers: { ...(applicant.answers || {}), _card: { c: msg.chat.id, m: msg.message_id } },
+                    });
+                }
+                await ctx.editMessageReplyMarkup(rejectReasonKeyboard(tidStr)).catch(() => {});
+                return;
             }
-            if (verb === 'rejskip') {
+            if (verb === 'rejback') {
+                await ctx.editMessageReplyMarkup(interview.pendingCardKeyboard(tidStr, applicant.answers?._match)).catch(() => {});
+                return;
+            }
+            if (verb === 'rejp' || verb === 'rejskip') {
                 if (applicant.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
-                await rejectApplicant(applicant, userId, null);
-                await ctx.editMessageReplyMarkup({
-                    inline_keyboard: [[
-                        { text: '↩️ אשר בדיעבד', callback_data: `aq:retro:${tidStr}` },
-                        { text: '📋 השלמה ידנית', callback_data: `aq:fill:${tidStr}` },
-                    ]],
-                }).catch(() => {});
-                return ctx.reply(`⛔ ${applicant.answers?.name || tidStr} סורב (ללא סיבה). ניתן לאשר בדיעבד מהכרטיס.`);
+                let reason = null;
+                if (verb === 'rejp') {
+                    const preset = REJECT_PRESETS.find(p => p.code === extraArg);
+                    if (!preset) return ctx.reply('⚠️ סיבה לא מוכרת, נסה שוב.');
+                    reason = preset.text;
+                }
+                const { stamped, summary } = await rejectAndReport(ctx, applicant, reason);
+                if (!stamped) {
+                    await ctx.editMessageReplyMarkup(REJECTED_CARD_KEYBOARD(tidStr)).catch(() => {});
+                    return ctx.reply(summary, { parse_mode: 'HTML' });
+                }
+                return;
+            }
+            if (verb === 'rejother') {
+                if (applicant.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
+                return promptAdminInPrivate(ctx, 'rejreason', applicant);
             }
             if (verb === 'replyto') {
-                await setUserMode(userId, `admin_reply:${tidStr}`);
-                return ctx.reply('✍️ כתוב/כתבי את התשובה שתישלח למועמד:');
+                return promptAdminInPrivate(ctx, 'admin_reply', applicant);
+            }
+
+            // --- Preview buttons (in the admin's private chat): send or drop the typed draft ---
+            if (verb === 'dsend' || verb === 'ddrop') {
+                const draft = applicant.answers?._draft;
+                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+                // The preview carries the id of the draft it shows. If the draft was rewritten
+                // (or another admin drafted in the meantime), this preview is out of date.
+                if (!draft || draft.n !== extraArg) {
+                    return ctx.reply('ℹ️ התצוגה הזו כבר לא עדכנית (הטיוטה נשלחה, בוטלה או נכתבה מחדש). שום דבר לא נשלח.');
+                }
+                const cleanAnswers = { ...(applicant.answers || {}) };
+                delete cleanAnswers._draft;
+                await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: cleanAnswers });
+                if (verb === 'ddrop') return ctx.reply('בוטל, שום דבר לא נשלח. ✔️');
+
+                if (draft.k === 'rejreason') {
+                    if (applicant.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
+                    if (applicant.status === 'approved') return ctx.reply('ℹ️ המועמד אושר בינתיים, הדחייה לא נשלחה.');
+                    const { summary } = await rejectAndReport(ctx, { ...applicant, answers: cleanAnswers }, draft.t);
+                    return ctx.reply(summary, { parse_mode: 'HTML' });
+                }
+                let delivered = true;
+                await ctx.telegram.sendMessage(applicant.telegram_id,
+                    `💬 תגובה מצוות Blue Jay Aviation:\n\n${escapeHTML(draft.t)}`,
+                    { parse_mode: 'HTML' }
+                ).catch(() => { delivered = false; });
+                return ctx.reply(delivered
+                    ? '✅ התשובה נמסרה למועמד.'
+                    : '⚠️ התשובה לא נמסרה למועמד (ייתכן שחסם את הבוט). כדאי לפנות אליו ישירות.');
             }
             if (verb === 'closeappeal') {
                 await supabase.from('users').update({ chat_mode: null }).eq('user_id', applicant.telegram_id);
@@ -728,15 +1259,13 @@ bot.on('callback_query', async (ctx) => {
                 const cleanAnswers = { ...applicant.answers };
                 delete cleanAnswers._admin_pick;
                 await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: cleanAnswers });
-                const note = await approveApplicant({ ...applicant, answers: cleanAnswers }, userId, picks);
-                await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
-                return ctx.reply(`✅ ${applicant.answers?.name || tidStr} אושר ונוסף לגיליון.${note}`);
+                return approveAndReport(ctx, { ...applicant, answers: cleanAnswers }, userId, picks, 'auto');
             }
             if (verb === 'gcancel') {
                 const cleanAnswers = { ...applicant.answers };
                 delete cleanAnswers._admin_pick;
                 await interview.upsertApplicant({ telegram_id: applicant.telegram_id, answers: cleanAnswers });
-                await ctx.editMessageReplyMarkup(interview.pendingCardKeyboard(tidStr)).catch(() => {});
+                await ctx.editMessageReplyMarkup(interview.pendingCardKeyboard(tidStr, cleanAnswers._match)).catch(() => {});
                 return;
             }
 
@@ -970,41 +1499,17 @@ bot.on(message('text'), async (ctx) => {
         }
     }
 
-    // --- Flow: Admin typing a rejection reason (aq:rej prompt) ---
-    if (ADMINS.includes(userId) && mode?.startsWith('rejreason:')) {
-        if (text === '/cancel') {
-            await setUserMode(userId, null);
-            return ctx.reply('בוטל. ✔️');
-        }
-        const targetTid = parseInt(mode.slice('rejreason:'.length));
-        const target = await interview.getApplicant(targetTid);
+    // --- Flow: Admin typing a custom rejection reason, or a reply to a rejected applicant.
+    // Both are armed by a button (promptAdminInPrivate) and both only produce a PREVIEW
+    // here: nothing reaches the applicant until the admin presses "send" on it. ---
+    if (ADMINS.includes(userId) && (mode?.startsWith('rejreason:') || mode?.startsWith('admin_reply:'))) {
+        const [kind, tidPart] = mode.split(':');
         await setUserMode(userId, null);
+        if (text === '/cancel') return ctx.reply('בוטל, שום דבר לא נשלח. ✔️');
+        const target = await interview.getApplicant(parseInt(tidPart));
         if (!target) return ctx.reply('⚠️ מועמד לא נמצא.');
-        if (target.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
-        await rejectApplicant(target, userId, text);
-        return ctx.reply(`⛔ ${target.answers?.name || targetTid} סורב עם הסיבה שצוינה.`, {
-            reply_markup: {
-                inline_keyboard: [[
-                    { text: '↩️ אשר בדיעבד', callback_data: `aq:retro:${targetTid}` },
-                    { text: '📋 השלמה ידנית', callback_data: `aq:fill:${targetTid}` },
-                ]],
-            },
-        });
-    }
-
-    // --- Flow: Admin typing a reply to a rejected applicant's appeal ---
-    if (ADMINS.includes(userId) && mode?.startsWith('admin_reply:')) {
-        if (text === '/cancel') {
-            await setUserMode(userId, null);
-            return ctx.reply('בוטל. ✔️');
-        }
-        const targetTid = parseInt(mode.slice('admin_reply:'.length));
-        await setUserMode(userId, null);
-        await ctx.telegram.sendMessage(targetTid,
-            `💬 תגובה מצוות Blue Jay Aviation:\n\n${escapeHTML(text)}`,
-            { parse_mode: 'HTML' }
-        ).catch(() => {});
-        return ctx.reply('✅ נשלח למועמד.');
+        if (kind === 'rejreason' && target.status === 'rejected') return ctx.reply('ℹ️ כבר סורב.');
+        return previewAdminDraft(ctx, kind, target, text);
     }
 
     // --- Flow: Join interview (free-text answers) ---
